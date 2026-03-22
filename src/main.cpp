@@ -8,7 +8,6 @@
 
 #include <M5Dial.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
@@ -48,6 +47,10 @@ String rightSideName = "Right";
 // Power state per side
 bool leftPowerOn = true;
 bool rightPowerOn = true;
+
+// Current (actual) temperature per side (from Pod sensors)
+int leftCurrentTempF = TEMP_DEFAULT_F;
+int rightCurrentTempF = TEMP_DEFAULT_F;
 
 // Auto-restart (daily, for reliability)
 bool autoRestartEnabled = false;
@@ -119,9 +122,6 @@ String wifiPasswordInput = "";
 int passwordCharIndex = 0;
 const char alphaNumeric[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:',.<>?/ ";
 
-// Web server (local API exposed by the dial)
-WebServer server(API_PORT);
-
 // Display dimensions
 const int centerX = SCREEN_WIDTH / 2;
 const int centerY = SCREEN_HEIGHT / 2;
@@ -135,7 +135,6 @@ LGFX_Sprite sprite(&M5Dial.Display);
 
 void setupWiFi();
 void setupMDNS();
-void setupWebServer();
 void setupNTP();
 void drawTemperatureUI();
 void drawSettingsMenu();
@@ -149,10 +148,6 @@ void handleEncoderInIPEditor();
 void handleEncoderInWiFiScanner();
 void handleEncoderInPasswordEntry();
 void handleTouchInput();
-void handleAPIRoot();
-void handleAPITemperature();
-void handleAPISetTemperature();
-void handleNotFound();
 void updateBrightness();
 void recordActivity();
 bool isNightTime();
@@ -184,6 +179,18 @@ void setup()
 
   // Load saved settings from NVS
   preferences.begin("sleepypod", false);
+
+  // Clear stale NVS WiFi from previous firmware if migrating
+  uint8_t fwVersion = preferences.getUChar("fwVer", 0);
+  if (fwVersion < 1)
+  {
+    // First boot of this firmware — clear old WiFi creds so credentials.h is used
+    preferences.remove("wifiSSID");
+    preferences.remove("wifiPass");
+    preferences.putUChar("fwVer", 1);
+    Serial.println("First boot: cleared stale NVS WiFi credentials");
+  }
+
   podIP = IPAddress(
       preferences.getUChar("podIP0", 192),
       preferences.getUChar("podIP1", 168),
@@ -227,9 +234,6 @@ void setup()
   // Setup mDNS for Pod discovery and self-announcement
   setupMDNS();
 
-  // Setup web server
-  setupWebServer();
-
   // Setup NTP time sync
   setupNTP();
 
@@ -254,11 +258,6 @@ void loop()
 {
   M5Dial.update();
   unsigned long currentMillis = millis();
-
-  if (wifiConnected)
-  {
-    server.handleClient();
-  }
 
   handleEncoderInput();
   handleTouchInput();
@@ -344,7 +343,7 @@ void loop()
     }
   }
 
-  delay(10);
+  delay(2);
 }
 
 // ==================== WiFi & Network ====================
@@ -435,173 +434,6 @@ void setupMDNS()
 
 // ==================== Web Server (Local API) ====================
 
-void setupWebServer()
-{
-  if (!wifiConnected) return;
-
-  server.on("/", HTTP_GET, handleAPIRoot);
-  server.on("/api/temperature", HTTP_GET, handleAPITemperature);
-  server.on("/api/temperature", HTTP_POST, handleAPISetTemperature);
-  server.on("/api/status", HTTP_GET, []()
-            {
-    JsonDocument doc;
-    doc["podIP"] = podIP.toString();
-    doc["podPort"] = podPort;
-    doc["podFound"] = podFound;
-    doc["activeSide"] = rightSideActive ? "right" : "left";
-    doc["left"]["setpoint"] = leftSetpoint;
-    doc["left"]["powered"] = leftPowerOn;
-    doc["right"]["setpoint"] = rightSetpoint;
-    doc["right"]["powered"] = rightPowerOn;
-    doc["unit"] = useFahrenheit ? "fahrenheit" : "celsius";
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json", response); });
-  server.on("/api/config/pod-ip", HTTP_GET, []()
-            {
-    JsonDocument doc;
-    doc["ip"] = podIP.toString();
-    doc["port"] = podPort;
-    String response;
-    serializeJson(doc, response);
-    server.send(200, "application/json", response); });
-  server.on("/api/config/pod-ip", HTTP_POST, []()
-            {
-    if (server.hasArg("plain")) {
-      JsonDocument doc;
-      DeserializationError error = deserializeJson(doc, server.arg("plain"));
-      if (!error && doc["ip"].is<const char*>()) {
-        String ipStr = doc["ip"].as<String>();
-        if (podIP.fromString(ipStr)) {
-          if (doc["port"].is<int>()) podPort = doc["port"].as<int>();
-          preferences.putUChar("podIP0", podIP[0]);
-          preferences.putUChar("podIP1", podIP[1]);
-          preferences.putUChar("podIP2", podIP[2]);
-          preferences.putUChar("podIP3", podIP[3]);
-          preferences.putUShort("podPort", podPort);
-          server.send(200, "application/json", "{\"success\":true}");
-          return;
-        }
-      }
-    }
-    server.send(400, "application/json", "{\"error\":\"Invalid IP\"}"); });
-  server.onNotFound(handleNotFound);
-
-  server.begin();
-  Serial.printf("Local HTTP server on port %d\n", API_PORT);
-}
-
-void handleAPIRoot()
-{
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<title>Sleepypod Dial</title>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>";
-  html += "body{font-family:Arial;text-align:center;padding:20px;background:#1a1a2e;color:#fff}";
-  html += ".temp{font-size:72px;color:#00ff88;margin:30px 0}";
-  html += ".unit{font-size:24px}.info{color:#888;margin:10px 0}";
-  html += ".sides{display:flex;justify-content:center;gap:40px;margin:20px 0}";
-  html += ".side{padding:15px;border-radius:10px;background:#252550}";
-  html += ".active{border:2px solid #00ff88}";
-  html += "</style></head><body>";
-  html += "<h1>Sleepypod Dial</h1>";
-  html += "<div class='sides'>";
-
-  // Left side
-  html += "<div class='side" + String(!rightSideActive ? " active" : "") + "'>";
-  html += "<h3>Left</h3>";
-  html += "<div class='temp'>" + String(leftSetpoint) + "<span class='unit'>&deg;F</span></div>";
-  html += "<p>" + String(leftPowerOn ? "ON" : "OFF") + "</p></div>";
-
-  // Right side
-  html += "<div class='side" + String(rightSideActive ? " active" : "") + "'>";
-  html += "<h3>Right</h3>";
-  html += "<div class='temp'>" + String(rightSetpoint) + "<span class='unit'>&deg;F</span></div>";
-  html += "<p>" + String(rightPowerOn ? "ON" : "OFF") + "</p></div>";
-
-  html += "</div>";
-  html += "<p class='info'>Pod: " + podIP.toString() + ":" + String(podPort) + "</p>";
-  html += "<p class='info'>API: GET/POST /api/temperature | GET /api/status</p>";
-  html += "<script>setInterval(()=>location.reload(),5000);</script>";
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
-}
-
-void handleAPITemperature()
-{
-  JsonDocument doc;
-  doc["setpoint"] = getActiveSetpoint();
-  doc["side"] = rightSideActive ? "right" : "left";
-  doc["left"] = leftSetpoint;
-  doc["right"] = rightSetpoint;
-  doc["unit"] = "fahrenheit";
-  doc["min"] = TEMP_MIN_F;
-  doc["max"] = TEMP_MAX_F;
-  String response;
-  serializeJson(doc, response);
-  server.send(200, "application/json", response);
-}
-
-void handleAPISetTemperature()
-{
-  if (server.hasArg("plain"))
-  {
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, server.arg("plain"));
-    if (error)
-    {
-      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
-      return;
-    }
-
-    if (doc["setpoint"].is<int>())
-    {
-      int newTemp = doc["setpoint"].as<int>();
-      if (newTemp < TEMP_MIN_F) newTemp = TEMP_MIN_F;
-      if (newTemp > TEMP_MAX_F) newTemp = TEMP_MAX_F;
-
-      // Optionally set side
-      if (doc["side"].is<const char*>())
-      {
-        String side = doc["side"].as<String>();
-        if (side == "left")
-        {
-          leftSetpoint = newTemp;
-          setPodTemperature(podIP, "left", newTemp, podPort);
-        }
-        else if (side == "right")
-        {
-          rightSetpoint = newTemp;
-          setPodTemperature(podIP, "right", newTemp, podPort);
-        }
-      }
-      else
-      {
-        getActiveSetpoint() = newTemp;
-        const char *side = rightSideActive ? "right" : "left";
-        setPodTemperature(podIP, side, newTemp, podPort);
-      }
-
-      drawTemperatureUI();
-
-      JsonDocument resp;
-      resp["success"] = true;
-      resp["setpoint"] = getActiveSetpoint();
-      String response;
-      serializeJson(resp, response);
-      server.send(200, "application/json", response);
-      return;
-    }
-  }
-  server.send(400, "application/json", "{\"error\":\"Missing setpoint\"}");
-}
-
-void handleNotFound()
-{
-  server.send(404, "application/json", "{\"error\":\"Not found\"}");
-}
-
 // ==================== Encoder Input ====================
 
 void handleEncoderInput()
@@ -629,11 +461,11 @@ void handleEncoderInput()
     lastEncoderPosition = newPosition;
     recordActivity();
 
-    // 2 encoder counts per detent = 1°F step
-    if (abs(encoderAccumulator) >= 2)
+    // 1 encoder count = 1°F step (maximum responsiveness)
+    if (abs(encoderAccumulator) >= 1)
     {
-      int steps = encoderAccumulator / 2;
-      encoderAccumulator = encoderAccumulator % 2;
+      int steps = encoderAccumulator;
+      encoderAccumulator = 0;
 
       int &activeSetpoint = getActiveSetpoint();
       int newTemp = activeSetpoint + steps;
@@ -749,33 +581,28 @@ void handleTouchInput()
       return;
     }
 
-    // Side selection buttons
+    // Bottom buttons
     const int buttonY = SCREEN_HEIGHT - 55;
     const int buttonSize = 40;
     const int leftButtonX = 50;
     const int rightButtonX = SCREEN_WIDTH - 50;
 
-    // Left button
+    // Left button (active side label) — tap to toggle side
     if (abs(touch.x - leftButtonX) < buttonSize / 2 && abs(touch.y - buttonY) < buttonSize / 2)
     {
-      if (rightSideActive)
-      {
-        rightSideActive = false;
-        Serial.println("Switched to Left side");
-        drawTemperatureUI();
-      }
+      rightSideActive = !rightSideActive;
+      Serial.printf("Switched to %s side\n", rightSideActive ? "Right" : "Left");
+      drawTemperatureUI();
       return;
     }
 
-    // Right button
+    // Right button (gear icon) — open settings
     if (abs(touch.x - rightButtonX) < buttonSize / 2 && abs(touch.y - buttonY) < buttonSize / 2)
     {
-      if (!rightSideActive)
-      {
-        rightSideActive = true;
-        Serial.println("Switched to Right side");
-        drawTemperatureUI();
-      }
+      inSettingsMenu = true;
+      lastEncoderPosition = M5Dial.Encoder.read();
+      Serial.println("Gear button: opened settings");
+      drawSettingsMenu();
       return;
     }
 
@@ -895,12 +722,7 @@ void drawTemperatureUI()
   // Background arc
   sprite.fillArc(centerX, centerY, arcRadius, arcRadius - arcThickness, startAngle, endAngle, arcBgColor);
 
-  // Subtle ring outlines
-  uint16_t outlineColor = nightMode ? 0x1000 : 0x1082;
-  sprite.drawArc(centerX, centerY, arcRadius, arcRadius, startAngle, endAngle, outlineColor);
-  sprite.drawArc(centerX, centerY, arcRadius - arcThickness, arcRadius - arcThickness, startAngle, endAngle, outlineColor);
-
-  // Colored gradient arc up to current setpoint
+  // Colored gradient arc up to current setpoint (small segments for smooth gradient)
   int activeTemp = getActiveSetpoint();
   float tempPercent = (float)(activeTemp - TEMP_MIN_F) / (float)(TEMP_MAX_F - TEMP_MIN_F);
   float currentAngle = startAngle + tempPercent * totalArcDegrees;
@@ -920,49 +742,35 @@ void drawTemperatureUI()
     sprite.fillArc(centerX, centerY, arcRadius, arcRadius - arcThickness, angle, segEnd, color);
   }
 
-  // Rounded end caps
+  // Rounded end caps (anti-aliased)
   float startRad = fmodf(startAngle, 360.0f) * PI / 180.0f;
   int startCapX = centerX + cos(startRad) * arcMidRadius;
   int startCapY = centerY + sin(startRad) * arcMidRadius;
   uint16_t startColor = nightMode ? getTemperatureColorNight(0.0f) : getTemperatureColor(0.0f);
-  sprite.fillCircle(startCapX, startCapY, capRadius, startColor);
+  sprite.fillSmoothCircle(startCapX, startCapY, capRadius, startColor);
 
   float endRad = fmodf(currentAngle, 360.0f) * PI / 180.0f;
   int endCapX = centerX + cos(endRad) * arcMidRadius;
   int endCapY = centerY + sin(endRad) * arcMidRadius;
   uint16_t endColor = nightMode ? getTemperatureColorNight(tempPercent) : getTemperatureColor(tempPercent);
-  sprite.fillCircle(endCapX, endCapY, capRadius, endColor);
+  sprite.fillSmoothCircle(endCapX, endCapY, capRadius, endColor);
 
   // Active setpoint indicator line
   {
     int lineInner = arcRadius - arcThickness - 3;
     int lineOuter = arcRadius + 3;
+    uint16_t lineColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
     int lx1 = centerX + cos(endRad) * lineInner;
     int ly1 = centerY + sin(endRad) * lineInner;
     int lx2 = centerX + cos(endRad) * lineOuter;
     int ly2 = centerY + sin(endRad) * lineOuter;
-    uint16_t lineColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
     sprite.drawLine(lx1, ly1, lx2, ly2, lineColor);
     float offsetRad = endRad + 0.008f;
-    int lx1b = centerX + cos(offsetRad) * lineInner;
-    int ly1b = centerY + sin(offsetRad) * lineInner;
-    int lx2b = centerX + cos(offsetRad) * lineOuter;
-    int ly2b = centerY + sin(offsetRad) * lineOuter;
-    sprite.drawLine(lx1b, ly1b, lx2b, ly2b, lineColor);
-  }
-
-  // Subtle tick mark for the inactive side's setpoint
-  {
-    int inactiveTemp = getInactiveSetpoint();
-    float inactivePct = (float)(inactiveTemp - TEMP_MIN_F) / (float)(TEMP_MAX_F - TEMP_MIN_F);
-    float inactiveAngle = startAngle + inactivePct * totalArcDegrees;
-    float inactiveRad = fmodf(inactiveAngle, 360.0f) * PI / 180.0f;
-    int tx1 = centerX + cos(inactiveRad) * (arcRadius - arcThickness);
-    int ty1 = centerY + sin(inactiveRad) * (arcRadius - arcThickness);
-    int tx2 = centerX + cos(inactiveRad) * arcRadius;
-    int ty2 = centerY + sin(inactiveRad) * arcRadius;
-    uint16_t tickColor = nightMode ? 0x4000 : 0x4208;
-    sprite.drawLine(tx1, ty1, tx2, ty2, tickColor);
+    sprite.drawLine(
+        centerX + (int)(cos(offsetRad) * lineInner),
+        centerY + (int)(sin(offsetRad) * lineInner),
+        centerX + (int)(cos(offsetRad) * lineOuter),
+        centerY + (int)(sin(offsetRad) * lineOuter), lineColor);
   }
 
   // Power state of active side
@@ -998,19 +806,46 @@ void drawTemperatureUI()
   sprite.drawString(useFahrenheit ? "F" : "C", unitX + 7, unitY + 4);
   sprite.setTextDatum(middle_center);
 
+  // Status text below target — show heating/cooling direction, hide when at target
+  if (activePowerOn)
+  {
+    int activeCurrentF = rightSideActive ? rightCurrentTempF : leftCurrentTempF;
+    int diff = activeTemp - activeCurrentF;
+
+    if (diff != 0)
+    {
+      sprite.setFont(&fonts::FreeSans9pt7b);
+      uint16_t statusColor = nightMode ? 0x4000 : 0x6B4D;
+      sprite.setTextColor(statusColor);
+      sprite.setTextDatum(middle_center);
+
+      sprite.drawString((diff > 0) ? "heating" : "cooling", centerX, centerY + 25);
+    }
+  }
+
   // OFF indicator
   if (!activePowerOn)
   {
     sprite.setFont(&fonts::FreeSansBold12pt7b);
     sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
-    sprite.drawString("OFF", centerX, centerY + 55);
+    sprite.drawString("OFF", centerX, centerY + 25);
   }
 
-  // Clock at bottom
+  // Connection status / clock at bottom
   sprite.setFont(&fonts::Font0);
-  sprite.setTextColor(textColor);
-  if (timeInitialized)
+  sprite.setTextDatum(middle_center);
+
+  if (!wifiConnected)
   {
+    // Show WiFi disconnected prominently
+    sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
+    sprite.drawString("WiFi Disconnected", centerX, SCREEN_HEIGHT - 28);
+    sprite.setTextColor(textColor);
+    sprite.drawString("Open settings to connect", centerX, SCREEN_HEIGHT - 16);
+  }
+  else if (timeInitialized)
+  {
+    sprite.setTextColor(textColor);
     struct tm timeinfo;
     if (getLocalTime(&timeinfo))
     {
@@ -1021,40 +856,35 @@ void drawTemperatureUI()
     }
   }
 
-  // Side selection buttons
+  // Bottom buttons
   const int buttonY = SCREEN_HEIGHT - 55;
   const int leftButtonX = 50;
   const int rightButtonX = SCREEN_WIDTH - 50;
   const int btnRadius = 18;
 
-  // Left side button — show first letter of side name, or full short name
-  uint16_t leftBgColor = !rightSideActive ? setpointColor : arcBgColor;
-  uint16_t leftIconColor = !rightSideActive ? bgColor : textColor;
-  sprite.fillCircle(leftButtonX, buttonY, btnRadius, leftBgColor);
-  sprite.setTextColor(leftIconColor);
+  // Left button — active side initial
+  String &activeName = rightSideActive ? rightSideName : leftSideName;
+  sprite.fillSmoothCircle(leftButtonX, buttonY, btnRadius, setpointColor);
+  sprite.setTextColor(bgColor);
   sprite.setTextDatum(middle_center);
   {
-    // Use first 1-2 chars of the side name to fit in the button
-    String leftLabel = leftSideName.substring(0, 2);
-    if (leftSideName.length() <= 2)
-      sprite.setFont(&fonts::FreeSansBold12pt7b);
-    else
-      sprite.setFont(&fonts::FreeSans9pt7b);
-    sprite.drawString(leftLabel.c_str(), leftButtonX, buttonY);
+    String label = activeName.substring(0, 2);
+    sprite.setFont(label.length() <= 1 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSans9pt7b);
+    sprite.drawString(label.c_str(), leftButtonX, buttonY);
   }
 
-  // Right side button
-  uint16_t rightBgColor = rightSideActive ? setpointColor : arcBgColor;
-  uint16_t rightIconColor = rightSideActive ? bgColor : textColor;
-  sprite.fillCircle(rightButtonX, buttonY, btnRadius, rightBgColor);
-  sprite.setTextColor(rightIconColor);
+  // Right button — gear icon (settings)
+  sprite.fillSmoothCircle(rightButtonX, buttonY, btnRadius, arcBgColor);
   {
-    String rightLabel = rightSideName.substring(0, 2);
-    if (rightSideName.length() <= 2)
-      sprite.setFont(&fonts::FreeSansBold12pt7b);
-    else
-      sprite.setFont(&fonts::FreeSans9pt7b);
-    sprite.drawString(rightLabel.c_str(), rightButtonX, buttonY);
+    // Draw 3 horizontal bars (hamburger/settings icon)
+    uint16_t gearColor = textColor;
+    int bw = 12; // bar width
+    int bh = 2;  // bar height
+    int gap = 5; // gap between bars
+    for (int i = -1; i <= 1; i++)
+    {
+      sprite.fillRect(rightButtonX - bw / 2, buttonY + i * gap - bh / 2, bw, bh, gearColor);
+    }
   }
 
   // Push to display
@@ -1218,7 +1048,18 @@ void handleEncoderInSettings()
       break;
     case MENU_MDNS_DISCOVER:
     {
-      // Re-run mDNS discovery
+      bool nightMode = isNightTime();
+      uint16_t scanBg = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
+      uint16_t scanText = nightMode ? COLOR_NIGHT_SETPOINT : COLOR_SETPOINT;
+
+      // Show scanning feedback
+      sprite.fillSprite(scanBg);
+      sprite.setTextColor(scanText);
+      sprite.setTextDatum(middle_center);
+      sprite.setFont(&fonts::FreeSans12pt7b);
+      sprite.drawString("Scanning...", centerX, centerY);
+      sprite.pushSprite(0, 0);
+
       IPAddress discoveredIP;
       uint16_t discoveredPort;
       if (discoverPod(discoveredIP, discoveredPort))
@@ -1231,7 +1072,29 @@ void handleEncoderInSettings()
         preferences.putUChar("podIP2", podIP[2]);
         preferences.putUChar("podIP3", podIP[3]);
         preferences.putUShort("podPort", podPort);
-        Serial.printf("Pod re-discovered: %s:%d\n", podIP.toString().c_str(), podPort);
+
+        // Show success
+        sprite.fillSprite(scanBg);
+        sprite.setTextColor(scanText);
+        sprite.setFont(&fonts::FreeSans12pt7b);
+        sprite.drawString("Found Pod!", centerX, centerY - 15);
+        sprite.setFont(&fonts::Font0);
+        sprite.drawString((podIP.toString() + ":" + String(podPort)).c_str(), centerX, centerY + 15);
+        sprite.pushSprite(0, 0);
+        delay(2000);
+      }
+      else
+      {
+        // Show not found
+        sprite.fillSprite(scanBg);
+        sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
+        sprite.setFont(&fonts::FreeSans12pt7b);
+        sprite.drawString("Not Found", centerX, centerY - 10);
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextColor(nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT);
+        sprite.drawString("Set IP manually", centerX, centerY + 15);
+        sprite.pushSprite(0, 0);
+        delay(2000);
       }
       drawSettingsMenu();
       break;
@@ -1632,7 +1495,6 @@ void handleEncoderInPasswordEntry()
       savedWifiPassword = wifiPasswordInput;
       preferences.putString("wifiSSID", savedWifiSSID);
       preferences.putString("wifiPass", savedWifiPassword);
-      server.begin();
 
       sprite.fillSprite(bgColor);
       sprite.setTextColor(COLOR_SETPOINT);
@@ -1834,14 +1696,16 @@ void syncStatusFromPod()
     if (status.left.valid)
     {
       leftSetpoint = status.left.targetTemperatureF;
+      leftCurrentTempF = status.left.currentTemperatureF;
       leftPowerOn = status.left.isPowered;
-      Serial.printf("Left synced: %d°F, %s\n", leftSetpoint, leftPowerOn ? "ON" : "OFF");
+      Serial.printf("Left synced: target=%d°F actual=%d°F %s\n", leftSetpoint, leftCurrentTempF, leftPowerOn ? "ON" : "OFF");
     }
     if (status.right.valid)
     {
       rightSetpoint = status.right.targetTemperatureF;
+      rightCurrentTempF = status.right.currentTemperatureF;
       rightPowerOn = status.right.isPowered;
-      Serial.printf("Right synced: %d°F, %s\n", rightSetpoint, rightPowerOn ? "ON" : "OFF");
+      Serial.printf("Right synced: target=%d°F actual=%d°F %s\n", rightSetpoint, rightCurrentTempF, rightPowerOn ? "ON" : "OFF");
     }
   }
 
@@ -1895,9 +1759,14 @@ void syncFromPod()
         leftPowerOn = status.left.isPowered;
         needsRedraw = true;
       }
-      if (abs(leftSetpoint - status.left.targetTemperatureF) > 0)
+      if (leftSetpoint != status.left.targetTemperatureF)
       {
         leftSetpoint = status.left.targetTemperatureF;
+        needsRedraw = true;
+      }
+      if (leftCurrentTempF != status.left.currentTemperatureF)
+      {
+        leftCurrentTempF = status.left.currentTemperatureF;
         needsRedraw = true;
       }
     }
@@ -1908,9 +1777,14 @@ void syncFromPod()
         rightPowerOn = status.right.isPowered;
         needsRedraw = true;
       }
-      if (abs(rightSetpoint - status.right.targetTemperatureF) > 0)
+      if (rightSetpoint != status.right.targetTemperatureF)
       {
         rightSetpoint = status.right.targetTemperatureF;
+        needsRedraw = true;
+      }
+      if (rightCurrentTempF != status.right.currentTemperatureF)
+      {
+        rightCurrentTempF = status.right.currentTemperatureF;
         needsRedraw = true;
       }
     }
