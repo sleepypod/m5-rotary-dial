@@ -1,0 +1,38 @@
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Create credentials.h for build
+        run: cp include/credentials.h.example include/credentials.h
+
+      - name: Build firmware
+        run: pio run
+
+      - name: Static analysis (cppcheck)
+        run: pio check --fail-on-defect=high --skip-packages
+        continue-on-error: true
+
+      - name: Upload firmware artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: .pio/build/m5stack-dial/firmware.bin
+          retention-days: 30
