@@ -32,7 +32,6 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes
 - **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
 - **Power Control**: Short tap to toggle side on/off
-- **WebSocket Support**: Real-time sensor data streaming from Pod (port 3001)
 - **Auto-Restart**: Configurable daily restart for reliability
 
 ### Automatic Night Mode
