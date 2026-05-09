@@ -36,3 +36,15 @@ jobs:
           name: firmware
           path: .pio/build/m5stack-dial/firmware.bin
           retention-days: 30
+
+      # No host-runnable tests yet (firmware-only project). When `pio test`
+      # gains a native env with `--coverage`, point `files` at the gcov
+      # output and drop `disable_search: true`.
+      - name: Upload coverage reports to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: sleepypod/m5-rotary-dial
+          disable_search: true
+          fail_ci_if_error: false

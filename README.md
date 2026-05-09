@@ -1,5 +1,7 @@
 # Sleepypod MT Rotary Dial
 
+[![codecov](https://codecov.io/gh/sleepypod/m5-rotary-dial/branch/main/graph/badge.svg)](https://codecov.io/gh/sleepypod/m5-rotary-dial)
+
 An M5Stack Dial (ESP32-S3) temperature controller for [sleepypod-core](https://github.com/throwaway31265/free-sleep), providing a physical rotary interface to control your Eight Sleep Pod's left and right side temperatures.
 
 Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial) — the original FreeSleep rotary dial controller. This project adapts the concept to use sleepypod-core's tRPC/REST APIs, mDNS auto-discovery, and side-name personalization.
@@ -32,7 +34,6 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes
 - **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
 - **Power Control**: Short tap to toggle side on/off
-- **WebSocket Support**: Real-time sensor data streaming from Pod (port 3001)
 - **Auto-Restart**: Configurable daily restart for reliability
 
 ### Automatic Night Mode
