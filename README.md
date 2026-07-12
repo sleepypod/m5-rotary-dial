@@ -29,20 +29,21 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 ### sleepypod-core Integration
 - **mDNS Auto-Discovery**: Finds your Pod on the network automatically
 - **Personalized Side Names**: Fetches side names from sleepypod-core settings
-- **Real-Time Sync**: Polls Pod status every 30 seconds for external changes
+- **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
 - **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
-- **Power Control**: Short tap to toggle side on/off
-- **WebSocket Support**: Real-time sensor data streaming from Pod (port 3001)
+- **Power Control**: Short tap to toggle side on/off, with audible confirmation (daytime only)
+- **Connection Status**: "WiFi offline" / "Pod offline" indicator on the main screen when degraded
+- **Auto-Reconnect**: Recovers WiFi automatically after router restarts
 - **Auto-Restart**: Configurable daily restart for reliability
 
 ### Automatic Night Mode
 - **Automatic Activation**: Red-only theme between 10pm and 7am (configurable)
 - **Reduced Brightness**: 20% during night hours
-- **Manual Override**: Medium press (400-1000ms) on center to toggle
+- **Manual Override**: Medium press (400-1000ms) on center forces the opposite mode; Settings offers Auto / Forced On / Forced Off
 
 ### Smart Display
 - **Auto Dimming**: ~1% brightness after 10 seconds of inactivity
-- **Instant Wake**: Any touch or rotation wakes immediately
+- **Safe Wake**: The first touch or rotation while dimmed only wakes the screen — it never changes anything
 - **Double Buffering**: Flicker-free rendering via LGFX_Sprite
 
 ### Local REST API
@@ -136,9 +137,11 @@ To manually set the Pod IP:
       │      └─────┘       │
       │                     │
       │   [L]         [R]   │
-       ╲    12:34:56     ╱
+       ╲      12:34      ╱
         └─────────────────┘
 ```
+
+When the dial can't reach WiFi or the Pod, a "WiFi offline" / "Pod offline" indicator appears above the clock — setpoint changes made while offline are re-synced from the Pod, so check the indicator if the dial seems unresponsive.
 
 ### Controls
 
@@ -147,9 +150,9 @@ To manually set the Pod IP:
 | **Rotate dial** | Adjust temperature (1°F per click) |
 | **Double-press dial** | Reset to default (75°F) |
 | **Tap temperature arc** | Jump to that temperature |
-| **Short tap center** (<400ms) | Toggle power ON/OFF |
+| **Short tap center** (<400ms) | Toggle power ON/OFF (beeps to confirm, daytime only) |
 | **Double-tap center** | Reset to default temperature |
-| **Medium hold center** (400ms-1s) | Toggle night mode |
+| **Medium hold center** (400ms-1s) | Force day/night mode (opposite of current) |
 | **Long hold center** (>1s) | Open settings menu |
 | **Tap L button** | Switch to left side |
 | **Tap R button** | Switch to right side |
@@ -159,12 +162,12 @@ To manually set the Pod IP:
 
 | Setting | Description |
 |---------|-------------|
-| **WiFi Settings** | Scan and connect to WiFi |
-| **Pod IP Address** | Set Pod IP manually |
+| **WiFi Settings** | Scan and connect to WiFi (select DEL in the character carousel to backspace; hold the dial button to connect) |
+| **Pod IP Address** | Set Pod IP manually (tap to save at any octet) |
 | **Discover Pod** | Re-run mDNS discovery |
-| **Temperature Unit** | Toggle °F / °C display |
-| **Night Mode** | Toggle manual override |
-| **Active Side** | Switch default side (Left/Right) |
+| **Temperature Unit** | Toggle °F / °C display (a local choice sticks — Pod sync won't revert it) |
+| **Night Mode** | Cycle Auto / Forced On / Forced Off |
+| **Default Side** | Side selected at boot (doesn't switch the live side) |
 
 ## Architecture
 

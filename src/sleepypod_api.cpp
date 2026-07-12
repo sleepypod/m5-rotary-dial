@@ -47,7 +47,8 @@ PodStatus fetchPodStatus(IPAddress ip, uint16_t port)
   String url = "http://" + ip.toString() + ":" + String(port) + "/api/device/status";
 
   http.begin(url);
-  http.setTimeout(5000);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   int httpCode = http.GET();
 
@@ -154,7 +155,8 @@ bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   JsonDocument doc;
   doc["side"] = side;
@@ -188,7 +190,8 @@ bool setPodPower(IPAddress ip, const char *side, bool powered, uint16_t port)
 
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(5000);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   JsonDocument doc;
   doc["side"] = side;
@@ -231,7 +234,8 @@ PodSettings fetchPodSettings(IPAddress ip, uint16_t port)
   String url = "http://" + ip.toString() + ":" + String(port) + "/api/settings";
 
   http.begin(url);
-  http.setTimeout(5000);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
 
   int httpCode = http.GET();
 

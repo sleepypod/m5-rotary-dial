@@ -18,7 +18,6 @@ graph LR
     end
 
     Dial -- "REST API :3000" --> Pod
-    Dial -- "WebSocket :3001<br/>(sensor stream)" --> Pod
     Phone -- "REST + WS" --> Pod
     HA -- "GET/POST :80" --> Dial
 
