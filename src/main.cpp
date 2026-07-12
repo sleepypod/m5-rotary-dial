@@ -50,6 +50,10 @@ bool podReachable = true;
 int podSyncFailures = 0;
 unsigned long lastWifiCheck = 0;
 
+// setupMDNS/setupWebServer/setupNTP early-return when WiFi is down at
+// boot; this flag lets the reconnect paths run them exactly once later
+bool networkServicesStarted = false;
+
 // Saved WiFi credentials
 String savedWifiSSID = "";
 String savedWifiPassword = "";
@@ -181,6 +185,7 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
 int &getActiveSetpoint();
 int &getInactiveSetpoint();
 String getMenuItemName(MenuItem item);
+String htmlEscape(const String &s);
 void feedbackBeep(uint16_t freq);
 void drawBusyScreen(const char *msg);
 String fitText(const String &s, unsigned int maxChars);
@@ -223,6 +228,11 @@ void setup()
   useFahrenheit = preferences.getBool("useFahrenheit", true);
   unitOverridden = preferences.getBool("unitOverride", false);
 
+  // Load night mode override (validate — NVS could hold anything)
+  uint8_t savedNightOvr = preferences.getUChar("nightOvr", 0);
+  if (savedNightOvr > NIGHT_FORCE_OFF) savedNightOvr = NIGHT_AUTO;
+  nightOverride = (NightOverride)savedNightOvr;
+
   // Load default side
   defaultRightSide = preferences.getBool("rightSide", false);
   rightSideActive = defaultRightSide;
@@ -262,6 +272,7 @@ void setup()
   if (wifiConnected)
   {
     syncStatusFromPod();
+    networkServicesStarted = true;
   }
 
   // Get initial encoder position
@@ -325,6 +336,15 @@ void loop()
     {
       wifiConnected = nowConnected;
       Serial.printf("WiFi %s\n", nowConnected ? "reconnected" : "lost");
+      if (nowConnected && !networkServicesStarted)
+      {
+        // Boot was offline — mDNS, web server, and NTP never started
+        setupMDNS();
+        setupWebServer();
+        setupNTP();
+        syncStatusFromPod();
+        networkServicesStarted = true;
+      }
       if (!inSettingsMenu) drawTemperatureUI();
     }
     if (!nowConnected)
@@ -575,13 +595,13 @@ void handleAPIRoot()
 
   // Left side
   html += "<div class='side" + String(!rightSideActive ? " active" : "") + "'>";
-  html += "<h3>" + leftSideName + "</h3>";
+  html += "<h3>" + htmlEscape(leftSideName) + "</h3>";
   html += "<div class='temp'>" + leftTemp + "<span class='unit'>" + unitLabel + "</span></div>";
   html += "<p>" + String(leftPowerOn ? "ON" : "OFF") + "</p></div>";
 
   // Right side
   html += "<div class='side" + String(rightSideActive ? " active" : "") + "'>";
-  html += "<h3>" + rightSideName + "</h3>";
+  html += "<h3>" + htmlEscape(rightSideName) + "</h3>";
   html += "<div class='temp'>" + rightTemp + "<span class='unit'>" + unitLabel + "</span></div>";
   html += "<p>" + String(rightPowerOn ? "ON" : "OFF") + "</p></div>";
 
@@ -952,6 +972,7 @@ void handleTouchInput()
       // Medium hold: force the opposite of the current mode
       waitingForDoubleClick = false;
       nightOverride = isNightTime() ? NIGHT_FORCE_OFF : NIGHT_FORCE_ON;
+      preferences.putUChar("nightOvr", (uint8_t)nightOverride);
       Serial.printf("Night mode override: %s\n",
                     nightOverride == NIGHT_FORCE_ON ? "forced on" : "forced off");
       drawTemperatureUI();
@@ -1368,6 +1389,7 @@ void handleEncoderInSettings()
       break;
     case MENU_NIGHT_MODE:
       nightOverride = (NightOverride)(((int)nightOverride + 1) % 3);
+      preferences.putUChar("nightOvr", (uint8_t)nightOverride);
       drawSettingsMenu();
       break;
     case MENU_DEFAULT_SIDE:
@@ -1806,7 +1828,19 @@ void handleEncoderInPasswordEntry()
       savedWifiPassword = wifiPasswordInput;
       preferences.putString("wifiSSID", savedWifiSSID);
       preferences.putString("wifiPass", savedWifiPassword);
-      server.begin();
+      if (!networkServicesStarted)
+      {
+        // Boot was offline — routes were never registered; a bare
+        // server.begin() would serve nothing but 404s
+        setupMDNS();
+        setupWebServer();
+        setupNTP();
+        networkServicesStarted = true;
+      }
+      else
+      {
+        server.begin();
+      }
 
       sprite.fillSprite(bgColor);
       sprite.setTextColor(accentColor);
@@ -1935,6 +1969,18 @@ String fitText(const String &s, unsigned int maxChars)
 {
   if (s.length() <= maxChars) return s;
   return s.substring(0, maxChars - 2) + "..";
+}
+
+// Side names come from the Pod's API — escape before embedding in HTML
+String htmlEscape(const String &s)
+{
+  String out = s;
+  out.replace("&", "&amp;");
+  out.replace("<", "&lt;");
+  out.replace(">", "&gt;");
+  out.replace("\"", "&quot;");
+  out.replace("'", "&#39;");
+  return out;
 }
 
 // ==================== Time & Brightness ====================

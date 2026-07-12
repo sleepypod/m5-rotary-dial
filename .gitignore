@@ -28,3 +28,4 @@ Thumbs.db
 
 # Credentials
 include/credentials.h
+.reviews/
