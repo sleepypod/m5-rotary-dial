@@ -196,6 +196,7 @@ void startPasswordEntry();
 void syncFromPod();
 void syncStatusFromPod();
 void toggleActivePower();
+bool notePodRequestResult(bool ok);
 
 // ==================== Setup ====================
 
@@ -359,10 +360,10 @@ void loop()
     pendingApiUpdate = false;
     const char *side = rightSideActive ? "right" : "left";
     bool ok = setPodTemperature(podIP, side, getActiveSetpoint(), podPort);
-    if (ok) podSyncFailures = 0;
-    if (ok != podReachable)
+    bool reachable = notePodRequestResult(ok);
+    if (reachable != podReachable)
     {
-      podReachable = ok;
+      podReachable = reachable;
       if (!inSettingsMenu) drawTemperatureUI();
     }
   }
@@ -852,16 +853,20 @@ void handleTouchInput()
       return;
     }
 
+    // Bottom-center settings zone; wins over the enlarged side-button
+    // hitboxes where they overlap so a settings tap can't switch sides
+    bool inSettingsZone = abs(touch.x - centerX) < 60 && touch.y > SCREEN_HEIGHT - 45;
+
     // Side selection buttons (hitbox larger than the drawn circle for
-    // easier targeting; checked before the settings zone so the overlap
-    // region goes to the nearer button)
+    // easier targeting)
     const int buttonY = SCREEN_HEIGHT - 55;
     const int hitRadius = 28;
     const int leftButtonX = 50;
     const int rightButtonX = SCREEN_WIDTH - 50;
 
     // Left button
-    if (abs(touch.x - leftButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
+    if (!inSettingsZone &&
+        abs(touch.x - leftButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
     {
       if (rightSideActive)
       {
@@ -873,7 +878,8 @@ void handleTouchInput()
     }
 
     // Right button
-    if (abs(touch.x - rightButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
+    if (!inSettingsZone &&
+        abs(touch.x - rightButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
     {
       if (!rightSideActive)
       {
@@ -885,7 +891,7 @@ void handleTouchInput()
     }
 
     // Bottom area — open settings
-    if (abs(touch.x - centerX) < 60 && touch.y > SCREEN_HEIGHT - 45)
+    if (inSettingsZone)
     {
       inSettingsMenu = true;
       lastEncoderPosition = M5Dial.Encoder.read();
@@ -2083,17 +2089,35 @@ String getMenuItemName(MenuItem item)
 
 // ==================== Pod Sync ====================
 
+// Record the result of a Pod HTTP request and return whether the Pod
+// should be shown as reachable. Every failure feeds the back-off
+// counter; "Pod offline" only shows after two consecutive failures so
+// a single transient miss doesn't flap the banner.
+bool notePodRequestResult(bool ok)
+{
+  if (ok) podSyncFailures = 0;
+  else podSyncFailures++;
+  return ok || podSyncFailures < 2;
+}
+
 void toggleActivePower()
 {
   const char *side = rightSideActive ? "right" : "left";
   bool &power = rightSideActive ? rightPowerOn : leftPowerOn;
 
-  power = !power;
-  feedbackBeep(power ? 3000 : 2000);
-
-  bool ok = setPodPower(podIP, side, power, podPort);
-  if (ok) podSyncFailures = 0;
-  podReachable = ok; // Failure surfaces as "Pod offline" on redraw
+  // Only flip local state (and give success feedback) once the Pod
+  // confirms, so the display never shows a state the Pod didn't accept
+  bool ok = setPodPower(podIP, side, !power, podPort);
+  if (ok)
+  {
+    power = !power;
+    feedbackBeep(power ? 3000 : 2000);
+  }
+  else
+  {
+    feedbackBeep(1000); // Low error tone: toggle didn't go through
+  }
+  podReachable = notePodRequestResult(ok);
 
   drawTemperatureUI();
 }
@@ -2163,15 +2187,15 @@ void syncFromPod()
   PodStatus status = fetchPodStatus(podIP, podPort);
   bool needsRedraw = false;
 
-  if (status.success != podReachable)
+  bool reachable = notePodRequestResult(status.success);
+  if (reachable != podReachable)
   {
-    podReachable = status.success;
+    podReachable = reachable;
     needsRedraw = true;
   }
 
   if (status.success)
   {
-    podSyncFailures = 0;
     if (status.left.valid)
     {
       if (leftPowerOn != status.left.isPowered)
@@ -2198,10 +2222,6 @@ void syncFromPod()
         needsRedraw = true;
       }
     }
-  }
-  else
-  {
-    podSyncFailures++;
   }
 
   if (needsRedraw) drawTemperatureUI();
