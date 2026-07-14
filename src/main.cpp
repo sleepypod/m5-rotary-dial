@@ -1932,7 +1932,7 @@ void syncStatusFromPod()
 
   // Fetch device status (temperatures, power)
   PodStatus status = fetchPodStatus(podIP, podPort);
-  podReachable = status.success;
+  podReachable = notePodRequestResult(status.success);
   if (status.success)
   {
     if (status.left.valid)

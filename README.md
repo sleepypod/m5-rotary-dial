@@ -33,7 +33,7 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **Personalized Side Names**: Fetches side names from sleepypod-core settings
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
 - **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
-- **Power Control**: Short tap to toggle side on/off, with audible confirmation (daytime only)
+- **Power Control**: Short tap to toggle side on/off, with audible confirmation (beep is silent at night)
 - **Connection Status**: "WiFi offline" / "Pod offline" indicator on the main screen when degraded
 - **Auto-Reconnect**: Recovers WiFi automatically after router restarts
 - **Auto-Restart**: Configurable daily restart for reliability
@@ -152,7 +152,7 @@ When the dial can't reach WiFi or the Pod, a "WiFi offline" / "Pod offline" indi
 | **Rotate dial** | Adjust temperature (1°F per click) |
 | **Double-press dial** | Reset to default (75°F) |
 | **Tap temperature arc** | Jump to that temperature |
-| **Short tap center** (<400ms) | Toggle power ON/OFF (beeps to confirm, daytime only) |
+| **Short tap center** (<400ms) | Toggle power ON/OFF (confirmation beep is silent at night) |
 | **Double-tap center** | Reset to default temperature |
 | **Medium hold center** (400ms-1s) | Force day/night mode (opposite of current) |
 | **Long hold center** (>1s) | Open settings menu |
