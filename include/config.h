@@ -11,6 +11,7 @@
 
 // Sleepypod-core API Settings
 #define POD_API_PORT 3000  // sleepypod-core tRPC HTTP port
+#define HTTP_TIMEOUT_MS 1500 // Keep short: HTTP calls block the UI loop
 
 // Display Settings
 #define SCREEN_WIDTH 240

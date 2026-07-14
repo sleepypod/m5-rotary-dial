@@ -30,15 +30,36 @@ unsigned long lastClockUpdate = 0;
 bool isDimmed = false;
 bool timeInitialized = false;
 bool rightSideActive = false;   // false = left side (default), true = right side
-bool nightModeOverride = false; // Manual night mode override
 bool inSettingsMenu = false;
+
+// Night mode override: Auto follows the schedule; On/Off force it
+enum NightOverride
+{
+  NIGHT_AUTO = 0,
+  NIGHT_FORCE_ON,
+  NIGHT_FORCE_OFF
+};
+NightOverride nightOverride = NIGHT_AUTO;
+
+// Default side shown at boot (separate from the currently active side)
+bool defaultRightSide = false;
+
+// Connection health (shown on the main screen when degraded)
+bool podReachable = true;
+int podSyncFailures = 0;
+unsigned long lastWifiCheck = 0;
+
+// setupMDNS/setupNTP early-return when WiFi is down at boot; this flag
+// lets the reconnect paths run them exactly once later
+bool networkServicesStarted = false;
 
 // Saved WiFi credentials
 String savedWifiSSID = "";
 String savedWifiPassword = "";
 
 // Temperature unit setting (true = Fahrenheit, false = Celsius)
-bool useFahrenheit = true; // Default to Fahrenheit (native API unit)
+bool useFahrenheit = true;  // Default to Fahrenheit (native API unit)
+bool unitOverridden = false; // User set the unit locally; don't let Pod sync revert it
 
 // Side names (fetched from sleepypod-core settings)
 String leftSideName = "Left";
@@ -120,7 +141,9 @@ int scannedSSIDCount = 0;
 int selectedSSIDIndex = 0;
 String wifiPasswordInput = "";
 int passwordCharIndex = 0;
+bool pwLongPressFired = false;
 const char alphaNumeric[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:',.<>?/ ";
+// Carousel has one extra virtual entry at the end: DEL (backspace)
 
 // Display dimensions
 const int centerX = SCREEN_WIDTH / 2;
@@ -157,12 +180,17 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
 int &getActiveSetpoint();
 int &getInactiveSetpoint();
 String getMenuItemName(MenuItem item);
+void feedbackBeep(uint16_t freq);
+void drawBusyScreen(const char *msg);
+String fitText(const String &s, unsigned int maxChars);
+void saveIPFromEditor();
 void startIPEditor();
 void startWiFiScanner();
 void startPasswordEntry();
 void syncFromPod();
 void syncStatusFromPod();
 void toggleActivePower();
+bool notePodRequestResult(bool ok);
 
 // ==================== Setup ====================
 
@@ -205,10 +233,17 @@ void setup()
 
   // Load temperature unit setting
   useFahrenheit = preferences.getBool("useFahrenheit", true);
+  unitOverridden = preferences.getBool("unitOverride", false);
+
+  // Load night mode override (validate — NVS could hold anything)
+  uint8_t savedNightOvr = preferences.getUChar("nightOvr", 0);
+  if (savedNightOvr > NIGHT_FORCE_OFF) savedNightOvr = NIGHT_AUTO;
+  nightOverride = (NightOverride)savedNightOvr;
 
   // Load default side
-  rightSideActive = preferences.getBool("rightSide", false);
-  Serial.printf("Default side: %s\n", rightSideActive ? "Right" : "Left");
+  defaultRightSide = preferences.getBool("rightSide", false);
+  rightSideActive = defaultRightSide;
+  Serial.printf("Default side: %s\n", defaultRightSide ? "Right" : "Left");
 
   // Load cached side names (updated from Pod settings on sync)
   leftSideName = preferences.getString("leftName", "Left");
@@ -241,6 +276,7 @@ void setup()
   if (wifiConnected)
   {
     syncStatusFromPod();
+    networkServicesStarted = true;
   }
 
   // Get initial encoder position
@@ -290,17 +326,50 @@ void loop()
     updateClockDisplay();
   }
 
+  // WiFi health check + auto-reconnect
+  if (currentMillis - lastWifiCheck >= 10000)
+  {
+    lastWifiCheck = currentMillis;
+    bool nowConnected = (WiFi.status() == WL_CONNECTED);
+    if (nowConnected != wifiConnected)
+    {
+      wifiConnected = nowConnected;
+      Serial.printf("WiFi %s\n", nowConnected ? "reconnected" : "lost");
+      if (nowConnected && !networkServicesStarted)
+      {
+        // Boot was offline — mDNS and NTP never started
+        setupMDNS();
+        setupNTP();
+        syncStatusFromPod();
+        networkServicesStarted = true;
+      }
+      if (!inSettingsMenu) drawTemperatureUI();
+    }
+    if (!nowConnected)
+    {
+      WiFi.reconnect();
+    }
+  }
+
   // Handle debounced API updates
   if (pendingApiUpdate && (currentMillis - lastSetpointChangeTime >= API_DEBOUNCE_MS))
   {
     pendingApiUpdate = false;
     const char *side = rightSideActive ? "right" : "left";
-    setPodTemperature(podIP, side, getActiveSetpoint(), podPort);
+    bool ok = setPodTemperature(podIP, side, getActiveSetpoint(), podPort);
+    bool reachable = notePodRequestResult(ok);
+    if (reachable != podReachable)
+    {
+      podReachable = reachable;
+      if (!inSettingsMenu) drawTemperatureUI();
+    }
   }
 
-  // Periodic sync from Pod
+  // Periodic sync from Pod (back off after repeated failures so a dead
+  // Pod doesn't freeze the UI every 30 seconds)
+  unsigned long syncInterval = POD_SYNC_INTERVAL_MS * (podSyncFailures >= 3 ? 4 : 1);
   if (wifiConnected && !inSettingsMenu && !pendingApiUpdate &&
-      (currentMillis - lastPodSync >= POD_SYNC_INTERVAL_MS))
+      (currentMillis - lastPodSync >= syncInterval))
   {
     lastPodSync = currentMillis;
     syncFromPod();
@@ -355,6 +424,7 @@ void setupWiFi()
 
   Serial.printf("Connecting to WiFi: %s\n", ssid);
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
 
   int attempts = 0;
@@ -364,13 +434,17 @@ void setupWiFi()
     Serial.print(".");
     attempts++;
 
-    M5Dial.Display.fillScreen(COLOR_BACKGROUND);
-    M5Dial.Display.setTextSize(1);
-    M5Dial.Display.drawString("Connecting to WiFi", centerX, centerY - 20);
+    sprite.fillSprite(COLOR_BACKGROUND);
+    sprite.setTextColor(COLOR_TEXT);
+    sprite.setTextDatum(middle_center);
+    sprite.setFont(&fonts::Font0);
+    sprite.drawString("Connecting to WiFi", centerX, centerY - 25);
+    sprite.drawString(fitText(String(ssid), 24).c_str(), centerX, centerY - 5);
     String dots = "";
     for (int i = 0; i < (attempts % 4); i++)
       dots += ".";
-    M5Dial.Display.drawString(dots.c_str(), centerX, centerY + 10);
+    sprite.drawString(dots.c_str(), centerX, centerY + 20);
+    sprite.pushSprite(0, 0);
   }
 
   if (WiFi.status() == WL_CONNECTED)
@@ -378,11 +452,14 @@ void setupWiFi()
     wifiConnected = true;
     Serial.printf("\nWiFi Connected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-    M5Dial.Display.fillScreen(COLOR_BACKGROUND);
-    M5Dial.Display.setTextColor(COLOR_SETPOINT);
-    M5Dial.Display.drawString("WiFi Connected!", centerX, centerY - 20);
-    M5Dial.Display.setTextColor(COLOR_TEXT);
-    M5Dial.Display.drawString(WiFi.localIP().toString().c_str(), centerX, centerY + 10);
+    sprite.fillSprite(COLOR_BACKGROUND);
+    sprite.setTextColor(COLOR_SETPOINT);
+    sprite.setTextDatum(middle_center);
+    sprite.setFont(&fonts::Font0);
+    sprite.drawString("WiFi Connected!", centerX, centerY - 20);
+    sprite.setTextColor(COLOR_TEXT);
+    sprite.drawString(WiFi.localIP().toString().c_str(), centerX, centerY + 10);
+    sprite.pushSprite(0, 0);
     delay(1500);
   }
   else
@@ -390,12 +467,16 @@ void setupWiFi()
     wifiConnected = false;
     Serial.println("\nWiFi Failed!");
 
-    M5Dial.Display.fillScreen(COLOR_BACKGROUND);
-    M5Dial.Display.setTextColor(COLOR_ARC_HOT);
-    M5Dial.Display.drawString("WiFi Failed!", centerX, centerY - 10);
-    M5Dial.Display.setTextColor(COLOR_TEXT);
-    M5Dial.Display.drawString("Running offline", centerX, centerY + 10);
-    delay(2000);
+    sprite.fillSprite(COLOR_BACKGROUND);
+    sprite.setTextColor(COLOR_ARC_HOT);
+    sprite.setTextDatum(middle_center);
+    sprite.setFont(&fonts::Font0);
+    sprite.drawString("WiFi Failed!", centerX, centerY - 25);
+    sprite.setTextColor(COLOR_TEXT);
+    sprite.drawString("Running offline", centerX, centerY - 5);
+    sprite.drawString("Hold center for settings", centerX, centerY + 20);
+    sprite.pushSprite(0, 0);
+    delay(2500);
   }
 }
 
@@ -457,12 +538,19 @@ void handleEncoderInput()
 
   if (diff != 0)
   {
+    bool wasDimmedNow = isDimmed;
     encoderAccumulator += diff;
     lastEncoderPosition = newPosition;
     recordActivity();
 
+    // First rotation while dimmed only wakes the screen — never
+    // changes the setpoint (accidental bumps in the dark)
+    if (wasDimmedNow)
+    {
+      encoderAccumulator = 0;
+    }
     // 1 encoder count = 1°F step (maximum responsiveness)
-    if (abs(encoderAccumulator) >= 1)
+    else if (abs(encoderAccumulator) >= 1)
     {
       int steps = encoderAccumulator;
       encoderAccumulator = 0;
@@ -507,6 +595,7 @@ void handleEncoderInput()
       getActiveSetpoint() = TEMP_DEFAULT_F;
       Serial.printf("Double-click: Reset %s to %d°F\n",
                     rightSideActive ? "Right" : "Left", TEMP_DEFAULT_F);
+      feedbackBeep(2500);
       recordActivity();
       drawTemperatureUI();
       lastSetpointChangeTime = millis();
@@ -537,6 +626,14 @@ void handleTouchInput()
 
   if (touch.wasPressed())
   {
+    // First touch while dimmed only wakes the screen — never acts.
+    // Prevents accidental brushes in the dark from changing anything.
+    if (isDimmed)
+    {
+      recordActivity();
+      return;
+    }
+
     bool isCenterTouch = !inSettingsMenu &&
                          abs(touch.x - centerX) < 60 &&
                          abs(touch.y - centerY) < 60;
@@ -549,7 +646,16 @@ void handleTouchInput()
     // Settings menu touch handling
     if (inSettingsMenu)
     {
-      if (currentSubMenu != SUBMENU_NONE)
+      if (currentSubMenu == SUBMENU_IP_EDITOR)
+      {
+        // Tap saves, as the on-screen hint promises
+        saveIPFromEditor();
+        currentSubMenu = SUBMENU_NONE;
+        lastEncoderPosition = M5Dial.Encoder.read();
+        drawSettingsMenu();
+        return;
+      }
+      else if (currentSubMenu != SUBMENU_NONE)
       {
         currentSubMenu = SUBMENU_NONE;
         lastEncoderPosition = M5Dial.Encoder.read();
@@ -572,23 +678,15 @@ void handleTouchInput()
       return;
     }
 
-    // Bottom area — open settings
-    if (abs(touch.x - centerX) < 60 && touch.y > SCREEN_HEIGHT - 45)
-    {
-      inSettingsMenu = true;
-      lastEncoderPosition = M5Dial.Encoder.read();
-      drawSettingsMenu();
-      return;
-    }
-
-    // Bottom buttons
+    // Bottom buttons (hitbox larger than the drawn circle for easier
+    // targeting)
     const int buttonY = SCREEN_HEIGHT - 55;
-    const int buttonSize = 40;
+    const int hitRadius = 28;
     const int leftButtonX = 50;
     const int rightButtonX = SCREEN_WIDTH - 50;
 
     // Left button (active side label) — tap to toggle side
-    if (abs(touch.x - leftButtonX) < buttonSize / 2 && abs(touch.y - buttonY) < buttonSize / 2)
+    if (abs(touch.x - leftButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
     {
       rightSideActive = !rightSideActive;
       Serial.printf("Switched to %s side\n", rightSideActive ? "Right" : "Left");
@@ -597,7 +695,7 @@ void handleTouchInput()
     }
 
     // Right button (gear icon) — open settings
-    if (abs(touch.x - rightButtonX) < buttonSize / 2 && abs(touch.y - buttonY) < buttonSize / 2)
+    if (abs(touch.x - rightButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
     {
       inSettingsMenu = true;
       lastEncoderPosition = M5Dial.Encoder.read();
@@ -660,6 +758,7 @@ void handleTouchInput()
         getActiveSetpoint() = TEMP_DEFAULT_F;
         Serial.printf("Double-click: Reset %s to %d°F\n",
                       rightSideActive ? "Right" : "Left", TEMP_DEFAULT_F);
+        feedbackBeep(2500);
         if (isDimmed) { isDimmed = false; lastActivityTime = millis(); }
         drawTemperatureUI();
         lastSetpointChangeTime = millis();
@@ -681,10 +780,12 @@ void handleTouchInput()
     }
     else if (touchDuration < NIGHT_MODE_MAX_MS)
     {
-      // Medium hold: toggle night mode
+      // Medium hold: force the opposite of the current mode
       waitingForDoubleClick = false;
-      nightModeOverride = !nightModeOverride;
-      Serial.printf("Night mode override: %s\n", nightModeOverride ? "ON" : "OFF");
+      nightOverride = isNightTime() ? NIGHT_FORCE_OFF : NIGHT_FORCE_ON;
+      preferences.putUChar("nightOvr", (uint8_t)nightOverride);
+      Serial.printf("Night mode override: %s\n",
+                    nightOverride == NIGHT_FORCE_ON ? "forced on" : "forced off");
       drawTemperatureUI();
     }
     else
@@ -843,16 +944,24 @@ void drawTemperatureUI()
     sprite.setTextColor(textColor);
     sprite.drawString("Open settings to connect", centerX, SCREEN_HEIGHT - 16);
   }
-  else if (timeInitialized)
+  else
   {
-    sprite.setTextColor(textColor);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
+    if (!podReachable)
     {
-      char timeStr[10];
-      snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-               timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-      sprite.drawString(timeStr, centerX, SCREEN_HEIGHT - 22);
+      sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
+      sprite.drawString("Pod offline", centerX, SCREEN_HEIGHT - 34);
+    }
+    if (timeInitialized)
+    {
+      sprite.setTextColor(textColor);
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo))
+      {
+        char timeStr[10];
+        snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
+                 timeinfo.tm_hour, timeinfo.tm_min);
+        sprite.drawString(timeStr, centerX, SCREEN_HEIGHT - 22);
+      }
     }
   }
 
@@ -893,6 +1002,17 @@ void drawTemperatureUI()
 
 void updateClockDisplay()
 {
+  if (!timeInitialized) return;
+
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  // Only redraw when the displayed minute changes — avoids per-second
+  // sprite churn and distracting flicker on a bedside device
+  static int lastDrawnMinute = -1;
+  if (timeinfo.tm_min == lastDrawnMinute) return;
+  lastDrawnMinute = timeinfo.tm_min;
+
   bool nightMode = isNightTime();
   uint16_t bgColor = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
   uint16_t textColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
@@ -906,21 +1026,14 @@ void updateClockDisplay()
   timeSprite.createSprite(timeWidth, timeHeight);
   timeSprite.fillSprite(bgColor);
 
-  if (timeInitialized)
-  {
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo))
-    {
-      timeSprite.setFont(&fonts::Font0);
-      timeSprite.setTextColor(textColor);
-      timeSprite.setTextDatum(middle_center);
+  timeSprite.setFont(&fonts::Font0);
+  timeSprite.setTextColor(textColor);
+  timeSprite.setTextDatum(middle_center);
 
-      char timeStr[10];
-      snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d",
-               timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-      timeSprite.drawString(timeStr, timeWidth / 2, timeHeight / 2);
-    }
-  }
+  char timeStr[10];
+  snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
+           timeinfo.tm_hour, timeinfo.tm_min);
+  timeSprite.drawString(timeStr, timeWidth / 2, timeHeight / 2);
 
   timeSprite.pushSprite(timeX, timeY);
   timeSprite.deleteSprite();
@@ -980,10 +1093,11 @@ void drawSettingsMenu()
         value = useFahrenheit ? "Fahrenheit" : "Celsius";
         break;
       case MENU_NIGHT_MODE:
-        value = nightModeOverride ? "Override ON" : "Auto";
+        value = nightOverride == NIGHT_AUTO ? "Auto"
+                : (nightOverride == NIGHT_FORCE_ON ? "Forced On" : "Forced Off");
         break;
       case MENU_DEFAULT_SIDE:
-        value = rightSideActive ? rightSideName : leftSideName;
+        value = defaultRightSide ? rightSideName : leftSideName;
         break;
       default: break;
       }
@@ -1005,10 +1119,12 @@ void drawSettingsMenu()
     }
   }
 
+  // Short hints — the round display clips long lines near the bottom
   sprite.setTextDatum(middle_center);
   sprite.setFont(&fonts::Font0);
   sprite.setTextColor(textColor);
-  sprite.drawString("Turn to navigate | Click to select | Tap to exit", centerX, SCREEN_HEIGHT - 10);
+  sprite.drawString("Click: select", centerX, SCREEN_HEIGHT - 24);
+  sprite.drawString("Tap: exit", centerX, SCREEN_HEIGHT - 12);
 
   sprite.pushSprite(0, 0);
 }
@@ -1048,18 +1164,11 @@ void handleEncoderInSettings()
       break;
     case MENU_MDNS_DISCOVER:
     {
+      // Re-run mDNS discovery (blocking — show feedback first)
+      drawBusyScreen("Searching...");
       bool nightMode = isNightTime();
       uint16_t scanBg = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
       uint16_t scanText = nightMode ? COLOR_NIGHT_SETPOINT : COLOR_SETPOINT;
-
-      // Show scanning feedback
-      sprite.fillSprite(scanBg);
-      sprite.setTextColor(scanText);
-      sprite.setTextDatum(middle_center);
-      sprite.setFont(&fonts::FreeSans12pt7b);
-      sprite.drawString("Scanning...", centerX, centerY);
-      sprite.pushSprite(0, 0);
-
       IPAddress discoveredIP;
       uint16_t discoveredPort;
       if (discoverPod(discoveredIP, discoveredPort))
@@ -1101,16 +1210,20 @@ void handleEncoderInSettings()
     }
     case MENU_TEMP_UNIT:
       useFahrenheit = !useFahrenheit;
+      unitOverridden = true; // Local choice wins over Pod sync from now on
       preferences.putBool("useFahrenheit", useFahrenheit);
+      preferences.putBool("unitOverride", true);
       drawSettingsMenu();
       break;
     case MENU_NIGHT_MODE:
-      nightModeOverride = !nightModeOverride;
+      nightOverride = (NightOverride)(((int)nightOverride + 1) % 3);
+      preferences.putUChar("nightOvr", (uint8_t)nightOverride);
       drawSettingsMenu();
       break;
     case MENU_DEFAULT_SIDE:
-      rightSideActive = !rightSideActive;
-      preferences.putBool("rightSide", rightSideActive);
+      // Only changes which side is selected at boot — not the live side
+      defaultRightSide = !defaultRightSide;
+      preferences.putBool("rightSide", defaultRightSide);
       drawSettingsMenu();
       break;
     default: break;
@@ -1119,6 +1232,16 @@ void handleEncoderInSettings()
 }
 
 // ==================== IP Editor ====================
+
+void saveIPFromEditor()
+{
+  podIP = IPAddress(tempIPOctets[0], tempIPOctets[1], tempIPOctets[2], tempIPOctets[3]);
+  preferences.putUChar("podIP0", tempIPOctets[0]);
+  preferences.putUChar("podIP1", tempIPOctets[1]);
+  preferences.putUChar("podIP2", tempIPOctets[2]);
+  preferences.putUChar("podIP3", tempIPOctets[3]);
+  Serial.printf("Saved Pod IP: %s\n", podIP.toString().c_str());
+}
 
 void startIPEditor()
 {
@@ -1222,15 +1345,7 @@ void handleEncoderInIPEditor()
 
     if (ipEditorOctet >= 4)
     {
-      // Save IP
-      podIP = IPAddress(tempIPOctets[0], tempIPOctets[1], tempIPOctets[2], tempIPOctets[3]);
-      preferences.putUChar("podIP0", tempIPOctets[0]);
-      preferences.putUChar("podIP1", tempIPOctets[1]);
-      preferences.putUChar("podIP2", tempIPOctets[2]);
-      preferences.putUChar("podIP3", tempIPOctets[3]);
-
-      Serial.printf("Saved Pod IP: %s\n", podIP.toString().c_str());
-
+      saveIPFromEditor();
       currentSubMenu = SUBMENU_NONE;
       lastEncoderPosition = M5Dial.Encoder.read();
       drawSettingsMenu();
@@ -1251,6 +1366,8 @@ void startWiFiScanner()
   selectedSSIDIndex = 0;
   lastEncoderPosition = M5Dial.Encoder.read();
 
+  // scanNetworks blocks for several seconds — show feedback first
+  drawBusyScreen("Scanning...");
   int n = WiFi.scanNetworks();
   scannedSSIDCount = (n > 20) ? 20 : n;
 
@@ -1290,10 +1407,15 @@ void drawWiFiScanner()
     const int centerY_menu = SCREEN_HEIGHT / 2;
     const int itemSpacing = 35;
 
+    bool wrap = scannedSSIDCount > 4;
+
     for (int i = -2; i <= 2; i++)
     {
       int networkIndex = selectedSSIDIndex + i;
-      if (networkIndex < 0 || networkIndex >= scannedSSIDCount) continue;
+      if (wrap)
+        networkIndex = (networkIndex % scannedSSIDCount + scannedSSIDCount) % scannedSSIDCount;
+      else if (networkIndex < 0 || networkIndex >= scannedSSIDCount)
+        continue;
 
       int yPos = centerY_menu + (i * itemSpacing);
       if (yPos < 50 || yPos > SCREEN_HEIGHT - 30) continue;
@@ -1303,7 +1425,7 @@ void drawWiFiScanner()
         sprite.setFont(&fonts::FreeSansBold12pt7b);
         sprite.setTextColor(accentColor);
         sprite.setTextDatum(middle_center);
-        sprite.drawString(scannedSSIDs[networkIndex].c_str(), centerX, yPos);
+        sprite.drawString(fitText(scannedSSIDs[networkIndex], 14).c_str(), centerX, yPos);
         sprite.setFont(&fonts::FreeSans9pt7b);
         sprite.drawString(">", centerX - 100, yPos);
         sprite.drawString("<", centerX + 100, yPos);
@@ -1313,14 +1435,16 @@ void drawWiFiScanner()
         sprite.setFont(&fonts::FreeSans9pt7b);
         sprite.setTextColor(dimTextColor);
         sprite.setTextDatum(middle_center);
-        sprite.drawString(scannedSSIDs[networkIndex].c_str(), centerX, yPos);
+        sprite.drawString(fitText(scannedSSIDs[networkIndex], 18).c_str(), centerX, yPos);
       }
     }
 
+    // Short hints — the round display clips long lines near the bottom
     sprite.setFont(&fonts::Font0);
     sprite.setTextColor(textColor);
     sprite.setTextDatum(middle_center);
-    sprite.drawString("Turn to select | Click to connect | Tap to cancel", centerX, SCREEN_HEIGHT - 10);
+    sprite.drawString("Click: connect", centerX, SCREEN_HEIGHT - 24);
+    sprite.drawString("Tap: back", centerX, SCREEN_HEIGHT - 12);
   }
 
   sprite.pushSprite(0, 0);
@@ -1344,8 +1468,16 @@ void handleEncoderInWiFiScanner()
       encoderAccumulator = encoderAccumulator % 4;
 
       selectedSSIDIndex += steps;
-      if (selectedSSIDIndex < 0) selectedSSIDIndex = 0;
-      if (selectedSSIDIndex >= scannedSSIDCount) selectedSSIDIndex = scannedSSIDCount - 1;
+      if (scannedSSIDCount > 4)
+      {
+        // Wrap around like the settings menu
+        selectedSSIDIndex = (selectedSSIDIndex % scannedSSIDCount + scannedSSIDCount) % scannedSSIDCount;
+      }
+      else
+      {
+        if (selectedSSIDIndex < 0) selectedSSIDIndex = 0;
+        if (selectedSSIDIndex >= scannedSSIDCount) selectedSSIDIndex = scannedSSIDCount - 1;
+      }
 
       drawWiFiScanner();
     }
@@ -1365,6 +1497,9 @@ void startPasswordEntry()
   currentSubMenu = SUBMENU_WIFI_PASSWORD;
   wifiPasswordInput = "";
   passwordCharIndex = 0;
+  // Start true so the release of the click that opened this screen
+  // doesn't append a character; resets on the next press
+  pwLongPressFired = true;
   lastEncoderPosition = M5Dial.Encoder.read();
   drawPasswordEntry();
 }
@@ -1385,49 +1520,71 @@ void drawPasswordEntry()
 
   sprite.setFont(&fonts::FreeSans9pt7b);
   sprite.setTextColor(textColor);
-  sprite.drawString(scannedSSIDs[selectedSSIDIndex].c_str(), centerX, 55);
+  sprite.drawString(fitText(scannedSSIDs[selectedSSIDIndex], 18).c_str(), centerX, 52);
 
-  // Masked password
+  // Masked password (show the tail when it outgrows the screen)
   sprite.setFont(&fonts::FreeSansBold12pt7b);
   sprite.setTextColor(textColor);
   sprite.setTextDatum(middle_center);
   String maskedPassword = "";
   for (unsigned int i = 0; i < wifiPasswordInput.length(); i++) maskedPassword += "*";
-  sprite.drawString(maskedPassword.c_str(), centerX, centerY - 20);
+  if (maskedPassword.length() > 16)
+    maskedPassword = maskedPassword.substring(maskedPassword.length() - 16);
+  sprite.drawString(maskedPassword.c_str(), centerX, 82);
 
-  // Character carousel
+  // Character carousel (last entry is a virtual DEL/backspace)
   const int charSpacing = 30;
-  const int centerY_char = centerY + 40;
+  const int centerY_char = centerY + 30;
+  const int alphaLen = strlen(alphaNumeric);
+  const int carouselLen = alphaLen + 1;
 
-  for (int i = -2; i <= 2; i++)
+  for (int i = -1; i <= 1; i++)
   {
     int charIdx = passwordCharIndex + i;
-    int alphaLen = strlen(alphaNumeric);
-    charIdx = (charIdx + alphaLen) % alphaLen;
+    charIdx = (charIdx + carouselLen) % carouselLen;
     int yPos = centerY_char + (i * charSpacing);
+    bool isDel = (charIdx == alphaLen);
 
     if (i == 0)
     {
-      sprite.setFont(&fonts::FreeSansBold18pt7b);
       sprite.setTextColor(accentColor);
-      char charStr[2] = {alphaNumeric[charIdx], '\0'};
-      sprite.drawString(charStr, centerX, yPos);
-      sprite.drawRect(centerX - 15, yPos - 18, 30, 36, accentColor);
+      if (isDel)
+      {
+        sprite.setFont(&fonts::FreeSansBold9pt7b);
+        sprite.drawString("DEL", centerX, yPos);
+        sprite.drawRect(centerX - 26, yPos - 15, 52, 30, accentColor);
+      }
+      else
+      {
+        sprite.setFont(&fonts::FreeSansBold18pt7b);
+        char charStr[2] = {alphaNumeric[charIdx], '\0'};
+        sprite.drawString(charStr, centerX, yPos);
+        sprite.drawRect(centerX - 15, yPos - 18, 30, 36, accentColor);
+      }
     }
     else
     {
-      sprite.setFont(&fonts::FreeSans12pt7b);
       sprite.setTextColor(textColor);
-      char charStr[2] = {alphaNumeric[charIdx], '\0'};
-      sprite.drawString(charStr, centerX, yPos);
+      if (isDel)
+      {
+        sprite.setFont(&fonts::FreeSans9pt7b);
+        sprite.drawString("DEL", centerX, yPos);
+      }
+      else
+      {
+        sprite.setFont(&fonts::FreeSans12pt7b);
+        char charStr[2] = {alphaNumeric[charIdx], '\0'};
+        sprite.drawString(charStr, centerX, yPos);
+      }
     }
   }
 
+  // Short hints — the round display clips long lines near the bottom
   sprite.setFont(&fonts::Font0);
   sprite.setTextColor(textColor);
   sprite.setTextDatum(middle_center);
-  sprite.drawString("Turn to select char | Click to add | Long press to connect", centerX, SCREEN_HEIGHT - 20);
-  sprite.drawString("Tap screen to cancel", centerX, SCREEN_HEIGHT - 10);
+  sprite.drawString("Click: add   Hold: connect", centerX, SCREEN_HEIGHT - 34);
+  sprite.drawString("Tap: cancel", centerX, SCREEN_HEIGHT - 20);
 
   sprite.pushSprite(0, 0);
 }
@@ -1449,23 +1606,25 @@ void handleEncoderInPasswordEntry()
       int steps = encoderAccumulator / 4;
       encoderAccumulator = encoderAccumulator % 4;
 
-      int alphaLen = strlen(alphaNumeric);
-      passwordCharIndex = (passwordCharIndex + steps + alphaLen) % alphaLen;
+      int carouselLen = strlen(alphaNumeric) + 1; // +1 for DEL
+      passwordCharIndex = ((passwordCharIndex + steps) % carouselLen + carouselLen) % carouselLen;
       drawPasswordEntry();
     }
   }
 
-  // Click = add character
+  // Character add happens on RELEASE of a short press — never on press.
+  // Adding on press would append a junk character at the start of every
+  // long-press-to-connect.
   if (M5Dial.BtnA.wasPressed())
   {
     recordActivity();
-    wifiPasswordInput += alphaNumeric[passwordCharIndex];
-    drawPasswordEntry();
+    pwLongPressFired = false;
   }
 
   // Long press = submit and connect
-  if (M5Dial.BtnA.pressedFor(1000))
+  if (M5Dial.BtnA.pressedFor(1000) && !pwLongPressFired)
   {
+    pwLongPressFired = true;
     recordActivity();
 
     WiFi.begin(scannedSSIDs[selectedSSIDIndex].c_str(), wifiPasswordInput.c_str());
@@ -1474,16 +1633,18 @@ void handleEncoderInPasswordEntry()
     uint16_t bgColor = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
     uint16_t accentColor = nightMode ? COLOR_NIGHT_SETPOINT : COLOR_SETPOINT;
 
-    sprite.fillSprite(bgColor);
-    sprite.setTextColor(accentColor);
-    sprite.setTextDatum(middle_center);
-    sprite.setFont(&fonts::FreeSans12pt7b);
-    sprite.drawString("Connecting...", centerX, centerY);
-    sprite.pushSprite(0, 0);
-
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20)
     {
+      sprite.fillSprite(bgColor);
+      sprite.setTextColor(accentColor);
+      sprite.setTextDatum(middle_center);
+      sprite.setFont(&fonts::FreeSans12pt7b);
+      sprite.drawString("Connecting", centerX, centerY - 10);
+      String dots = "";
+      for (int i = 0; i <= (attempts % 3); i++) dots += ".";
+      sprite.drawString(dots.c_str(), centerX, centerY + 20);
+      sprite.pushSprite(0, 0);
       delay(500);
       attempts++;
     }
@@ -1495,9 +1656,16 @@ void handleEncoderInPasswordEntry()
       savedWifiPassword = wifiPasswordInput;
       preferences.putString("wifiSSID", savedWifiSSID);
       preferences.putString("wifiPass", savedWifiPassword);
+      if (!networkServicesStarted)
+      {
+        // Boot was offline — mDNS and NTP never started
+        setupMDNS();
+        setupNTP();
+        networkServicesStarted = true;
+      }
 
       sprite.fillSprite(bgColor);
-      sprite.setTextColor(COLOR_SETPOINT);
+      sprite.setTextColor(accentColor);
       sprite.setFont(&fonts::FreeSans12pt7b);
       sprite.drawString("Connected!", centerX, centerY);
       sprite.pushSprite(0, 0);
@@ -1511,11 +1679,41 @@ void handleEncoderInPasswordEntry()
       sprite.drawString("Connection Failed", centerX, centerY);
       sprite.pushSprite(0, 0);
       delay(2000);
+
+      // Fall back to the previously saved network so a failed attempt
+      // doesn't strand the dial offline
+      wifiConnected = false;
+      if (savedWifiSSID.length() > 0)
+      {
+        WiFi.begin(savedWifiSSID.c_str(), savedWifiPassword.c_str());
+      }
+      else
+      {
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
     }
 
     currentSubMenu = SUBMENU_NONE;
     lastEncoderPosition = M5Dial.Encoder.read();
     drawSettingsMenu();
+    return;
+  }
+
+  // Short-press release = add selected character (or DEL = backspace)
+  if (M5Dial.BtnA.wasReleased() && !pwLongPressFired)
+  {
+    recordActivity();
+    int alphaLen = strlen(alphaNumeric);
+    if (passwordCharIndex == alphaLen)
+    {
+      if (wifiPasswordInput.length() > 0)
+        wifiPasswordInput.remove(wifiPasswordInput.length() - 1);
+    }
+    else
+    {
+      wifiPasswordInput += alphaNumeric[passwordCharIndex];
+    }
+    drawPasswordEntry();
   }
 }
 
@@ -1568,6 +1766,33 @@ float mapFloat(float x, float in_min, float in_max, float out_min, float out_max
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
+// Short confirmation beep for actions with no other immediate feedback
+// (power toggle, setpoint reset). Silent at night.
+void feedbackBeep(uint16_t freq)
+{
+  if (isNightTime()) return;
+  M5Dial.Speaker.tone(freq, 40);
+}
+
+// Full-screen message for blocking operations (WiFi scan, mDNS discovery)
+void drawBusyScreen(const char *msg)
+{
+  bool nightMode = isNightTime();
+  sprite.fillSprite(nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND);
+  sprite.setTextColor(nightMode ? COLOR_NIGHT_SETPOINT : COLOR_SETPOINT);
+  sprite.setTextDatum(middle_center);
+  sprite.setFont(&fonts::FreeSans12pt7b);
+  sprite.drawString(msg, centerX, centerY);
+  sprite.pushSprite(0, 0);
+}
+
+// Truncate with ellipsis so long strings don't clip off the round display
+String fitText(const String &s, unsigned int maxChars)
+{
+  if (s.length() <= maxChars) return s;
+  return s.substring(0, maxChars - 2) + "..";
+}
+
 // ==================== Time & Brightness ====================
 
 void setupNTP()
@@ -1594,7 +1819,8 @@ void setupNTP()
 
 bool isNightTime()
 {
-  if (nightModeOverride) return true;
+  if (nightOverride == NIGHT_FORCE_ON) return true;
+  if (nightOverride == NIGHT_FORCE_OFF) return false;
   if (!timeInitialized) return false;
 
   struct tm timeinfo;
@@ -1660,27 +1886,42 @@ String getMenuItemName(MenuItem item)
   case MENU_MDNS_DISCOVER:  return "Discover Pod";
   case MENU_TEMP_UNIT:      return "Temperature Unit";
   case MENU_NIGHT_MODE:     return "Night Mode";
-  case MENU_DEFAULT_SIDE:   return "Active Side";
+  case MENU_DEFAULT_SIDE:   return "Default Side";
   default:                  return "Unknown";
   }
 }
 
 // ==================== Pod Sync ====================
 
+// Record the result of a Pod HTTP request and return whether the Pod
+// should be shown as reachable. Every failure feeds the back-off
+// counter; "Pod offline" only shows after two consecutive failures so
+// a single transient miss doesn't flap the banner.
+bool notePodRequestResult(bool ok)
+{
+  if (ok) podSyncFailures = 0;
+  else podSyncFailures++;
+  return ok || podSyncFailures < 2;
+}
+
 void toggleActivePower()
 {
   const char *side = rightSideActive ? "right" : "left";
+  bool &power = rightSideActive ? rightPowerOn : leftPowerOn;
 
-  if (rightSideActive)
+  // Only flip local state (and give success feedback) once the Pod
+  // confirms, so the display never shows a state the Pod didn't accept
+  bool ok = setPodPower(podIP, side, !power, podPort);
+  if (ok)
   {
-    rightPowerOn = !rightPowerOn;
-    setPodPower(podIP, side, rightPowerOn, podPort);
+    power = !power;
+    feedbackBeep(power ? 3000 : 2000);
   }
   else
   {
-    leftPowerOn = !leftPowerOn;
-    setPodPower(podIP, side, leftPowerOn, podPort);
+    feedbackBeep(1000); // Low error tone: toggle didn't go through
   }
+  podReachable = notePodRequestResult(ok);
 
   drawTemperatureUI();
 }
@@ -1691,6 +1932,7 @@ void syncStatusFromPod()
 
   // Fetch device status (temperatures, power)
   PodStatus status = fetchPodStatus(podIP, podPort);
+  podReachable = notePodRequestResult(status.success);
   if (status.success)
   {
     if (status.left.valid)
@@ -1725,9 +1967,10 @@ void syncStatusFromPod()
       preferences.putString("rightName", rightSideName);
     }
 
-    // Sync temperature unit preference from Pod
+    // Sync temperature unit preference from Pod — unless the user has
+    // explicitly chosen a unit on the dial
     bool podUsesF = (settings.temperatureUnit == "F");
-    if (podUsesF != useFahrenheit)
+    if (!unitOverridden && podUsesF != useFahrenheit)
     {
       useFahrenheit = podUsesF;
       preferences.putBool("useFahrenheit", useFahrenheit);
@@ -1749,6 +1992,13 @@ void syncFromPod()
 {
   PodStatus status = fetchPodStatus(podIP, podPort);
   bool needsRedraw = false;
+
+  bool reachable = notePodRequestResult(status.success);
+  if (reachable != podReachable)
+  {
+    podReachable = reachable;
+    needsRedraw = true;
+  }
 
   if (status.success)
   {
