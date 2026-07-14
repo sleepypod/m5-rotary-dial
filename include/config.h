@@ -13,9 +13,6 @@
 #define POD_API_PORT 3000  // sleepypod-core tRPC HTTP port
 #define HTTP_TIMEOUT_MS 1500 // Keep short: HTTP calls block the UI loop
 
-// Local API Server Settings (exposed by the dial for home automation)
-#define API_PORT 80
-
 // Display Settings
 #define SCREEN_WIDTH 240
 #define SCREEN_HEIGHT 240

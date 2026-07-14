@@ -12,7 +12,7 @@ The Sleepypod MT Rotary Dial is an M5Stack Dial (ESP32-S3) firmware that control
 graph LR
     subgraph LAN["Local Network (RFC 1918)"]
         Dial["M5Stack Dial<br/>sleepypod-dial.local"]
-        Pod["Eight Sleep Pod<br/>sleepypod-core<br/>:3000 HTTP / :3001 WS"]
+        Pod["Eight Sleep Pod<br/>sleepypod-core<br/>:3000 HTTP"]
         Phone["iOS App"]
         HA["Home Automation<br/>(optional)"]
     end
