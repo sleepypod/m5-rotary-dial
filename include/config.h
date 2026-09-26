@@ -28,7 +28,8 @@
 #define NIGHT_END_HOUR 7     // 7am
 
 // Interaction timing
-#define SETTINGS_HOLD_MS 1500     // Press-and-hold to open settings (progress ring)
+#define POWER_HOLD_MS 1000        // Hold the dial to toggle power (progress ring)
+#define SETTINGS_HOLD_MS 1500     // Hold the screen to open settings (progress ring)
 #define HOLD_RING_SHOW_MS 200     // Ring appears after this much of the hold
 #define CLICK_MAX_MS 400          // Press shorter than this = click (cycle side)
 #define ACCEL_WINDOW_MS 150       // 3 detents inside this window -> 2°F per detent

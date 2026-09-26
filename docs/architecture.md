@@ -150,6 +150,8 @@ flowchart LR
     end
 ```
 
+The encoder is polled by a 1ms FreeRTOS task (its GPIOs have no interrupt slot), and all Pod HTTP runs on a worker task on core 0; the loop hands it one flush or sync job at a time and folds the result back in on a later pass, so a slow Pod never blocks input or rendering.
+
 All rendering goes through one full-screen LGFX_Sprite. The loop only renders a frame when state changed, a tween is active (arc settle 180ms, side switch 220ms, hold ring), the marker is breathing (20fps), or the minute changed. Backlight changes fade in perceptual (sqrt) space. The dim state is a separate, minimal render: numeral plus one status dot.
 
 Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encoder path, `c` click, `o` power, `n` night override, `z` dim, `w` wake, `p` dump the framebuffer as hex. `tools/dial_shot.py <out.png> [cmds...]` drives this and writes a PNG.
@@ -160,7 +162,7 @@ Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encode
 stateDiagram-v2
     [*] --> MainScreen: Boot complete
 
-    MainScreen --> SettingsMenu: Hold dial or screen 1.5s\n(progress ring)
+    MainScreen --> SettingsMenu: Hold screen 1.5s\n(progress ring)
     SettingsMenu --> MainScreen: Tap screen
 
     SettingsMenu --> IPEditor: Select "Pod IP"
@@ -176,13 +178,12 @@ stateDiagram-v2
     state MainScreen {
         [*] --> LeftActive
         LeftActive --> RightActive: Click / swipe
-        RightActive --> BothActive: Click / swipe
-        BothActive --> LeftActive: Click / swipe
+        RightActive --> LeftActive: Click / swipe
 
-        LeftActive --> Off_L: 2 detents below 55°F
-        Off_L --> LeftActive: Any detent up
-        RightActive --> Off_R: 2 detents below 55°F
-        Off_R --> RightActive: Any detent up
+        LeftActive --> Off_L: Hold dial 1s\nor 2 detents below 55°F
+        Off_L --> LeftActive: Hold dial 1s\nor any detent up
+        RightActive --> Off_R: Hold dial 1s\nor 2 detents below 55°F
+        Off_R --> RightActive: Hold dial 1s\nor any detent up
     }
 ```
 

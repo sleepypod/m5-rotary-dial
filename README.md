@@ -21,9 +21,9 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 ## Features
 
 ### Temperature Control
-- **Left / Right / Both**: Click the dial or swipe to cycle sides; "Both" moves the two setpoints together
+- **Left / Right**: Click the dial or swipe to switch sides
 - **Rotary Dial Interface**: 1°F per detent, 2°F per detent when you spin it, never more
-- **OFF stop**: Two detents below 55°F turn the side off; any detent up turns it back on at its last setpoint
+- **Power**: Hold the dial for one second (a ring fills, red when turning off). Two detents below 55°F also turn the side off; any detent up turns it back on
 - **Temperature Range**: 55°F to 110°F (matching Pod hardware limits)
 - **Visual Temperature Arc**: 270° gradient from cold-water blue through a body-neutral white to red-orange
 - **Current-temperature marker**: A breathing dot and a shrinking "distance to go" arc show the mattress converging on the setpoint
@@ -32,7 +32,7 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **mDNS Auto-Discovery**: Finds your Pod on the network automatically
 - **Personalized Side Names**: Fetches side names from sleepypod-core settings
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
-- **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
+- **Debounced, non-blocking updates**: Changes are sent 500ms after the dial stops, from a worker task, so a slow Pod never stalls the dial
 - **Unconfirmed writes are visible**: The arc's end cap is hollow until the Pod acknowledges a change
 - **Local changes win**: Pod sync never overwrites a setpoint touched in the last 30 seconds
 - **Connection Status**: "No Wi-Fi" / "Pod offline" on the main screen when degraded
@@ -153,17 +153,17 @@ drawn hollow, the same cue used while a change is still unacknowledged.
 
 ### Controls
 
-Nothing on the main screen changes a value by touch, and nothing depends on
-a hold duration except settings, which shows its progress ring.
+Nothing on the main screen changes a value by touch. The two holds (power on
+the dial, settings on the screen) both show a progress ring.
 
 | Action | Result |
 |--------|--------|
 | **Rotate** | Adjust the active side's setpoint (1°F per detent; 2°F when spun) |
-| **Rotate 2 detents below 55°F** | Reach the OFF stop and turn the side off |
-| **Rotate up while off** | Turn the side back on at its last setpoint |
-| **Click the dial** | Cycle side: Left → Right → Both → Left |
-| **Swipe left / right** | Same as click, in either direction |
-| **Press and hold 1.5s** (dial or screen) | Open settings; a ring fills around the rim, release early to cancel |
+| **Hold the dial 1s** | Toggle the side's power; a ring fills around the rim (red when it will turn off), release early to cancel |
+| **Rotate 2 detents below 55°F** | Also turns the side off (the OFF stop); any detent up turns it back on |
+| **Click the dial** | Switch side |
+| **Swipe left / right** | Switch side |
+| **Hold the screen 1.5s** | Open settings; a ring fills around the rim, release early to cancel |
 | **Any input while dimmed** | Wakes the screen only (after the 3-second safe-wake arming) |
 
 ### Settings Menu
