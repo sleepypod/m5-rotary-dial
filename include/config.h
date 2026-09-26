@@ -28,39 +28,21 @@
 #define NIGHT_END_HOUR 7     // 7am
 
 // Interaction timing
-#define POWER_HOLD_MS 1000        // Hold the dial to toggle power (progress ring)
-#define SETTINGS_HOLD_MS 1500     // Hold the screen to open settings (progress ring)
+#define SETTINGS_HOLD_MS 1500     // Hold the dial or screen to open settings (progress ring)
 #define HOLD_RING_SHOW_MS 200     // Ring appears after this much of the hold
-#define CLICK_MAX_MS 400          // Press shorter than this = click (cycle side)
+#define CLICK_MAX_MS 400          // Press shorter than this = click (toggle power)
 #define ACCEL_WINDOW_MS 150       // 3 detents inside this window -> 2°F per detent
-#define SWIPE_MIN_PX 40           // Horizontal flick distance to switch side
 #define OFF_DETENTS 2             // Detents below minimum that reach the OFF stop
 #define REMOTE_SYNC_HOLDOFF_MS 30000 // Don't let Pod sync overwrite a fresh local change
 
 // Animation
 #define ARC_SETTLE_MS 180
 #define SIDE_SWITCH_MS 220
-#define BREATH_PERIOD_DAY_MS 2400
-#define BREATH_PERIOD_NIGHT_MS 4000
 
 // NTP Settings
 #define NTP_SERVER "pool.ntp.org"
 #define GMT_OFFSET_SEC -28800 // Pacific Standard Time (UTC-8)
 #define DAYLIGHT_OFFSET_SEC 0 // Adjust for daylight saving time
-
-// Day Mode Colors (RGB565 format)
-#define COLOR_BACKGROUND 0x0000 // Black
-#define COLOR_ARC_BG 0x2104     // Dark gray
-#define COLOR_ARC_HOT 0xF800    // Red
-#define COLOR_TEXT 0xFFFF       // White
-#define COLOR_SETPOINT 0x07E0   // Green
-
-// Night Mode Colors (RGB565 format - red theme)
-#define COLOR_NIGHT_BACKGROUND 0x0000 // Black
-#define COLOR_NIGHT_ARC_BG 0x2800     // Very dark red
-#define COLOR_NIGHT_ARC_HOT 0xF800    // Bright red
-#define COLOR_NIGHT_TEXT 0xF800       // Red text
-#define COLOR_NIGHT_SETPOINT 0xC000   // Dark orange-red
 
 // Main-screen palette, day (RGB565)
 #define UI_BG 0x0862         // #0B0E14 blue-black so the bezel reads as a ring
@@ -77,5 +59,18 @@
 #define UI_N_LOW 0x3000      // #300000 track, hints
 #define UI_N_MID 0x8800      // #880000 secondary
 #define UI_N_HIGH 0xE000     // #E00000 numeral, active side, alerts
+
+// Settings / secondary screens reuse the main-screen palette above
+#define COLOR_BACKGROUND UI_BG
+#define COLOR_ARC_BG UI_TRACK
+#define COLOR_ARC_HOT UI_ALERT
+#define COLOR_TEXT UI_SECONDARY
+#define COLOR_SETPOINT UI_TEXT   // selected item / accent
+
+#define COLOR_NIGHT_BACKGROUND UI_N_BG
+#define COLOR_NIGHT_ARC_BG UI_N_LOW
+#define COLOR_NIGHT_ARC_HOT UI_N_HIGH
+#define COLOR_NIGHT_TEXT UI_N_MID
+#define COLOR_NIGHT_SETPOINT UI_N_HIGH
 
 #endif // CONFIG_H

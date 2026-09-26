@@ -9,11 +9,11 @@
 // Interaction model (main screen):
 //   rotate            adjust the active side's setpoint (1°F/detent, 2°F when spun)
 //   rotate below min  two extra detents reach the OFF stop; rotating up turns back on
-//   click / swipe     switch side
-//   hold the dial     1s with a progress ring toggles the side's power
-//   hold the screen   1.5s with a progress ring opens settings
-// Nothing on the main screen changes a value by touch, and nothing depends on
-// a hold duration except settings, which shows its ring.
+//   click the dial    toggle the side's power (also: tap the power glyph)
+//   hold the dial     1s with a progress ring opens settings (also: tap the gear)
+// The side is a preference (Settings > Side); the arc shows the mattress
+// temperature as solid fill and the span still to travel to the target as a
+// hashed, slowly marching "loader" segment.
 
 #include <M5Dial.h>
 #include <WiFi.h>
@@ -174,7 +174,10 @@ const int ARC_R_MID = (ARC_R_OUTER + ARC_R_INNER) / 2;
 const int ARC_CAP_R = (ARC_R_OUTER - ARC_R_INNER) / 2;
 const float ARC_START = 135.0f;  // bottom-left
 const float ARC_SPAN = 270.0f;   // opening centred at the bottom
-const int CURRENT_R = 90;        // ring radius of the "current temperature" marker
+const int GLYPH_Y = 206;         // power / settings glyphs flank the clock in the arc opening
+const int GLYPH_POWER_X = 66;
+const int GLYPH_GEAR_X = 174;
+const int GLYPH_HIT_R = 26;
 
 // Ring table: every pixel of the 270° arc annulus, precomputed once at boot
 // (sprite offset, angle from ARC_START in 0.1°, 4-bit edge coverage). Filling
@@ -245,6 +248,7 @@ void httpTask(void *);
 // Serial debug channel (see handleSerialDebug): simulated detents feed the
 // real encoder path so the OFF stop and acceleration are exercised too
 long simulatedEncoderDelta = 0;
+unsigned long debugHoldMs = 0; // draw the settings ring as if held this long (demo captures)
 
 // Backlight fade
 float brightnessNow = BRIGHTNESS_DAY;
@@ -306,7 +310,7 @@ void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long
 float tweenValue(Tween &t, unsigned long now);
 float setpointAngle(int tempF);
 void buildArcTable();
-void drawArcRing(float fillAngle, bool powerOn, bool grey, const Theme &th);
+void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bool grey, const Theme &th);
 void flushPendingApi();
 void consumeHttpResults();
 void applyPodStatus(const PodStatus &status);
@@ -538,8 +542,8 @@ void loop()
     {
       bool turning = (currentMillis - lastDetentTime) < 1000;
       bool animating = arcTween.active || underlineTween.active || holdActive;
-      // The marker breathes only when the dial is at rest: rendering is the
-      // loop's biggest cost and rotation needs the loop free
+      // The hashed span marches only when the dial is at rest: rendering is
+      // the loop's biggest cost and rotation needs the loop free
       bool breathing = !turning && isActivePowerOn() && podReachable && wifiConnected;
       if (breathing)
       {
@@ -830,10 +834,9 @@ void handleEncoderInput()
   }
 }
 
-// Press-and-hold. A short press of the dial is a click (switch side).
-// Holding the dial fills a ring and toggles the side's power when it
-// completes; holding the screen fills a ring and opens settings.
-// Releasing early does nothing.
+// Press-and-hold. A short press of the dial is a click (toggle power).
+// Holding the dial or the screen fills a ring and opens settings when it
+// completes. Releasing early does nothing.
 void handleHold(unsigned long now)
 {
   if (inSettingsMenu) return;
@@ -867,17 +870,15 @@ void handleHold(unsigned long now)
 
   if (stillHeld)
   {
-    unsigned long target = holdIsTouch ? SETTINGS_HOLD_MS : POWER_HOLD_MS;
-    if (!holdConsumed && held >= target)
+    if (!holdConsumed && held >= SETTINGS_HOLD_MS)
     {
       holdActive = false;
       holdConsumed = true;
-      if (holdIsTouch) openSettings();
-      else setActivePower(!isActivePowerOn());
+      openSettings();
     }
     else if (holdIsTouch && (touch.isFlicking() || touch.wasFlicked()))
     {
-      holdConsumed = true; // a swipe is not a hold
+      holdConsumed = true; // a drag is not a hold
     }
     return;
   }
@@ -887,7 +888,7 @@ void handleHold(unsigned long now)
   if (holdConsumed) return;
   if (!holdIsTouch && held < CLICK_MAX_MS)
   {
-    cycleSide(+1);
+    setActivePower(!isActivePowerOn());
   }
   else
   {
@@ -931,17 +932,22 @@ void handleTouchInput()
     return;
   }
 
-  // Main screen: the only touch verb is a horizontal swipe to change side.
-  // Presses and holds are handled by handleHold().
-  if (touch.wasFlicked())
+  // Main screen: taps on the two glyphs in the arc opening. Holds are
+  // handled by handleHold(); nothing else on the screen reacts to touch.
+  if (touch.wasClicked())
   {
     if (isDimmed) return; // handleHold already woke the screen
-    int dx = touch.distanceX();
-    int dy = touch.distanceY();
-    if (abs(dx) >= SWIPE_MIN_PX && abs(dx) > abs(dy))
+    int dxp = touch.x - GLYPH_POWER_X, dyp = touch.y - GLYPH_Y;
+    int dxg = touch.x - GLYPH_GEAR_X, dyg = touch.y - GLYPH_Y;
+    if (dxp * dxp + dyp * dyp <= GLYPH_HIT_R * GLYPH_HIT_R)
     {
       holdConsumed = true;
-      cycleSide(dx > 0 ? +1 : -1);
+      setActivePower(!isActivePowerOn());
+    }
+    else if (dxg * dxg + dyg * dyg <= GLYPH_HIT_R * GLYPH_HIT_R)
+    {
+      holdConsumed = true;
+      openSettings();
     }
   }
 }
@@ -1072,25 +1078,6 @@ static void polar(float deg, int r, int &x, int &y)
   y = centerY + (int)lroundf(sinf(rad) * r);
 }
 
-// Thin anti-aliased ring segment built from short wide-line pieces
-static void drawThinArc(float a0, float a1, int r, float halfWidth, uint16_t color)
-{
-  if (a1 < a0) { float t = a0; a0 = a1; a1 = t; }
-  float step = 4.0f;
-  int px, py;
-  polar(a0, r, px, py);
-  for (float a = a0 + step; a < a1 + step; a += step)
-  {
-    float aa = a > a1 ? a1 : a;
-    int x, y;
-    polar(aa, r, x, y);
-    sprite.drawWideLine(px, py, x, y, halfWidth, color);
-    px = x;
-    py = y;
-    if (aa >= a1) break;
-  }
-}
-
 // Draws the numeral with a small degree mark and unit to its upper right
 static void drawTemperatureNumeral(int tempF, int cx, int cy, const lgfx::IFont *font,
                                    uint16_t color, uint16_t unitColor, bool showUnit)
@@ -1179,10 +1166,12 @@ void buildArcTable()
   Serial.printf("Arc table: %d px, %u bytes\n", n, (unsigned)(n * sizeof(ArcPx)));
 }
 
-// Writes the track and the gradient fill straight into the sprite buffer.
-// fillAngle is absolute (ARC_START..ARC_START+ARC_SPAN); grey draws the fill
-// in the muted colour (Wi-Fi down: the arc is stale).
-void drawArcRing(float fillAngle, bool powerOn, bool grey, const Theme &th)
+// Writes the track and the fill straight into the sprite buffer. Angles are
+// absolute (ARC_START..ARC_START+ARC_SPAN). Solid gradient up to solidAngle;
+// between hashFrom and hashTo the gradient is hashed (8° period, marching
+// by phase10) to read as "still travelling". Pass solidAngle < ARC_START for
+// no fill. grey draws in the muted colour (Wi-Fi down: the arc is stale).
+void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bool grey, const Theme &th)
 {
   if (!arcTable) return;
   if (gradientLutNight != (int)th.night)
@@ -1190,7 +1179,9 @@ void drawArcRing(float fillAngle, bool powerOn, bool grey, const Theme &th)
     for (int i = 0; i < 256; i++) gradientLut[i] = arcColor(i / 255.0f, th);
     gradientLutNight = (int)th.night;
   }
-  int fill10 = powerOn ? (int)((fillAngle - ARC_START) * 10.0f) : -1;
+  int solid10 = (int)((solidAngle - ARC_START) * 10.0f);
+  int hash0 = (int)((hashFrom - ARC_START) * 10.0f);
+  int hash1 = (int)((hashTo - ARC_START) * 10.0f);
   uint16_t *buf = (uint16_t *)sprite.getBuffer();
   const uint16_t bg = th.bg;
   for (int i = 0; i < arcTableLen; i++)
@@ -1199,8 +1190,20 @@ void drawArcRing(float fillAngle, bool powerOn, bool grey, const Theme &th)
     int a10 = packed & 0x0FFF;
     uint8_t cov = packed >> 12;
     uint16_t c;
-    if (a10 <= fill10) c = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
-    else c = th.track;
+    if (a10 <= solid10)
+    {
+      c = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
+    }
+    else if (a10 > hash0 && a10 <= hash1)
+    {
+      uint16_t g = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
+      int stripe = ((a10 - hash0 + phase10 + 8000) / 40) & 1; // 4° on, 4° off
+      c = stripe ? lerp565(th.track, g, 0.35f) : g;
+    }
+    else
+    {
+      c = th.track;
+    }
     if (cov < 15) c = lerp565(bg, c, cov / 15.0f);
     buf[arcTable[i].offset] = __builtin_bswap16(c);
   }
@@ -1231,8 +1234,24 @@ void renderMainScreen(unsigned long now)
   float fillAngle = tweenValue(arcTween, now);
 
   uint32_t tS = micros();
-  // ---- Track + setpoint fill (one pass over the ring table) ----
-  drawArcRing(fillAngle, powerOn, !wifiConnected, th);
+  // ---- Track, solid fill to the mattress temperature, hashed span to the target ----
+  int currentF = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
+  int diff = shownF - currentF;
+  bool converging = powerOn && online && abs(diff) > 1;
+  float solidAngle = powerOn ? fillAngle : ARC_START - 1.0f;
+  float hashFrom = ARC_START - 1.0f, hashTo = ARC_START - 1.0f;
+  int phase10 = 0;
+  if (converging)
+  {
+    float curAngle = setpointAngle(currentF);
+    solidAngle = fminf(curAngle, fillAngle);
+    hashFrom = solidAngle;
+    hashTo = fmaxf(curAngle, fillAngle);
+    // March toward the target: 8° period over 4 s, direction follows heating/cooling
+    int p = (int)((now / 50) % 80);
+    phase10 = (diff > 0) ? (80 - p) : p;
+  }
+  drawArcRing(solidAngle, hashFrom, hashTo, phase10, !wifiConnected, th);
   uint16_t fillDim = th.muted;
   {
     int x, y;
@@ -1256,28 +1275,6 @@ void renderMainScreen(unsigned long now)
   }
 
   sectUs[0] = micros() - tS; tS = micros();
-  // ---- Current mattress temperature marker + distance-to-go ----
-  int currentF = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
-  int diff = shownF - currentF;
-  bool converging = powerOn && online && abs(diff) > 1;
-  if (online && (converging || !powerOn))
-  {
-    float curAngle = setpointAngle(currentF);
-    uint16_t statusColor = diff > 0 ? th.warm : th.cool;
-    uint16_t markerColor = th.secondary;
-    if (converging)
-    {
-      unsigned long period = th.night ? BREATH_PERIOD_NIGHT_MS : BREATH_PERIOD_DAY_MS;
-      float phase = (float)(now % period) / (float)period;
-      float breath = 0.5f + 0.5f * sinf(phase * 2.0f * PI);
-      markerColor = lerp565(th.muted, statusColor, breath);
-      drawThinArc(curAngle, fillAngle, CURRENT_R, 1.0f, markerColor);
-    }
-    int x, y;
-    polar(curAngle, CURRENT_R, x, y);
-    sprite.fillSmoothCircle(x, y, 3, powerOn ? markerColor : th.secondary);
-  }
-
   // ---- Side pair at the top ----
   {
     String ln = fitText(leftSideName, 8);
@@ -1328,10 +1325,6 @@ void renderMainScreen(unsigned long now)
     {
       drawStatusLine("Pod offline", "", y, th.alert);
     }
-    else if (holdActive && !holdConsumed && !holdIsTouch && now - holdStartTime >= HOLD_RING_SHOW_MS)
-    {
-      drawStatusLine(powerOn ? "hold to turn off" : "hold to turn on", "", y, th.secondary);
-    }
     else if (!powerOn)
     {
       formatTemp(currentF, val, sizeof(val));
@@ -1374,23 +1367,37 @@ void renderMainScreen(unsigned long now)
       snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
       sprite.setFont(&fonts::Font2);
       sprite.setTextColor(th.secondary);
-      sprite.drawString(timeStr, centerX, 206);
+      sprite.drawString(timeStr, centerX, GLYPH_Y);
     }
+  }
+  if (wifiConnected)
+  {
+    // Power glyph: open ring with a stem. Lit when on, muted when off.
+    uint16_t pc = powerOn ? th.secondary : th.muted;
+    sprite.drawArc(GLYPH_POWER_X, GLYPH_Y, 8, 6, 305, 595, pc);
+    sprite.fillSmoothRoundRect(GLYPH_POWER_X - 1, GLYPH_Y - 10, 3, 9, 1, pc);
+    // Gear glyph: ring with six teeth
+    uint16_t gc = th.muted;
+    sprite.fillSmoothCircle(GLYPH_GEAR_X, GLYPH_Y, 6, gc);
+    for (int i = 0; i < 6; i++)
+    {
+      float a = i * 60.0f * PI / 180.0f;
+      sprite.drawWideLine(GLYPH_GEAR_X + cosf(a) * 4, GLYPH_Y + sinf(a) * 4,
+                          GLYPH_GEAR_X + cosf(a) * 9, GLYPH_Y + sinf(a) * 9, 1.4f, gc);
+    }
+    sprite.fillSmoothCircle(GLYPH_GEAR_X, GLYPH_Y, 2, th.bg);
   }
 
   // ---- Settings hold ring (outside the arc) ----
-  if (holdActive && !holdConsumed)
+  if ((holdActive && !holdConsumed) || debugHoldMs)
   {
-    unsigned long held = now - holdStartTime;
+    unsigned long held = debugHoldMs ? debugHoldMs : now - holdStartTime;
     if (held >= HOLD_RING_SHOW_MS)
     {
-      unsigned long target = holdIsTouch ? SETTINGS_HOLD_MS : POWER_HOLD_MS;
-      float p = (float)(held - HOLD_RING_SHOW_MS) / (float)(target - HOLD_RING_SHOW_MS);
+      float p = (float)(held - HOLD_RING_SHOW_MS) / (float)(SETTINGS_HOLD_MS - HOLD_RING_SHOW_MS);
       if (p > 1.0f) p = 1.0f;
       p = easeOutCubic(p);
-      // Power ring turns alert-coloured when it will switch the side off
-      uint16_t ringColor = (!holdIsTouch && powerOn) ? th.alert : th.text;
-      sprite.fillArc(centerX, centerY, 118, 113, 270, 270 + 360.0f * p, ringColor);
+      sprite.fillArc(centerX, centerY, 118, 113, 270, 270 + 360.0f * p, th.text);
     }
   }
 
@@ -1618,9 +1625,11 @@ void handleEncoderInSettings()
       drawSettingsMenu();
       break;
     case MENU_DEFAULT_SIDE:
-      // Only changes which side is selected at boot — not the live side
+      // The side is a preference: switch it live and remember it
       defaultRightSide = !defaultRightSide;
       preferences.putBool("rightSide", defaultRightSide);
+      activeSide = defaultRightSide ? SIDE_RIGHT : SIDE_LEFT;
+      offDetentAccum = 0;
       drawSettingsMenu();
       break;
     default: break;
@@ -2122,6 +2131,9 @@ void handleEncoderInPasswordEntry()
 //   + / -  one detent up / down     c  click (switch side)  o  toggle power
 //   n      cycle night override     z  force dim now        w  wake
 //   p      dump the framebuffer as hex (240 rows of RGB565)
+//   h / l  fake the mattress 9°F below / above the setpoint (heating / cooling)
+//   a      fake the mattress at the setpoint    H  draw the settings ring half full
+//   S / x  open / close the settings menu       f  frame timing
 void handleSerialDebug()
 {
   while (Serial.available())
@@ -2139,7 +2151,20 @@ void handleSerialDebug()
       drawTemperatureUI();
       break;
     case 'z': lastActivityTime = millis() - DIM_TIMEOUT_MS - 1; break;
-    case 'w': recordActivity(); break;
+    case 'w': recordActivity(); debugHoldMs = 0; drawTemperatureUI(); break;
+    case 'h': case 'l': case 'a':
+    {
+      // Local only; the 30s sync hold-off keeps the Pod from correcting it at once
+      int &cur = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
+      int off = (c == 'h') ? -9 : (c == 'l' ? 9 : 0);
+      cur = getDisplaySetpoint() + off;
+      lastActivityTime = millis();
+      drawTemperatureUI();
+      break;
+    }
+    case 'H': debugHoldMs = HOLD_RING_SHOW_MS + (SETTINGS_HOLD_MS - HOLD_RING_SHOW_MS) / 2; drawTemperatureUI(); break;
+    case 'S': if (!inSettingsMenu) { recordActivity(); openSettings(); } break;
+    case 'x': if (inSettingsMenu) { inSettingsMenu = false; currentSubMenu = SUBMENU_NONE; lastEncoderPosition = readEncoder(); drawTemperatureUI(); } break;
     case 'p': dumpScreen(); break;
     case 'f':
       Serial.printf("frame last=%luus max=%luus n=%lu heap=%u arc=%lu marker=%lu text=%lu push=%lu\n",
@@ -2335,7 +2360,7 @@ String getMenuItemName(MenuItem item)
   case MENU_MDNS_DISCOVER:  return "Discover Pod";
   case MENU_TEMP_UNIT:      return "Temperature Unit";
   case MENU_NIGHT_MODE:     return "Night Mode";
-  case MENU_DEFAULT_SIDE:   return "Default Side";
+  case MENU_DEFAULT_SIDE:   return "Side";
   default:                  return "Unknown";
   }
 }

@@ -21,12 +21,12 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 ## Features
 
 ### Temperature Control
-- **Left / Right**: Click the dial or swipe to switch sides
+- **Your side is a preference**: Settings > Side picks Left or Right and sticks; nothing on the main screen switches it by accident
 - **Rotary Dial Interface**: 1°F per detent, 2°F per detent when you spin it, never more
-- **Power**: Hold the dial for one second (a ring fills, red when turning off). Two detents below 55°F also turn the side off; any detent up turns it back on
+- **Power**: Click the dial or tap the power glyph. Two detents below 55°F also turn the side off; any detent up turns it back on
 - **Temperature Range**: 55°F to 110°F (matching Pod hardware limits)
 - **Visual Temperature Arc**: 270° gradient from cold-water blue through a body-neutral white to red-orange
-- **Current-temperature marker**: A breathing dot and a shrinking "distance to go" arc show the mattress converging on the setpoint
+- **One timeline**: Solid fill is the mattress temperature; the hashed, slowly marching span is the distance still to travel to the target, like a loader
 
 ### sleepypod-core Integration
 - **mDNS Auto-Discovery**: Finds your Pod on the network automatically
@@ -140,30 +140,30 @@ To manually set the Pod IP:
       │                       │
       │     heating · 69      │      ← mattress temperature and direction
        ╲                     ╱
-        ╲      12:26        ╱        ← clock sits in the arc's opening
+        ╲  ⏻    12:26    ⚙ ╱        ← power and settings glyphs flank the clock
          └─────────────────┘
 ```
 
-The 270° arc opens at the bottom. Its fill is the setpoint; a small dot on
-an inner ring is the current mattress temperature, joined to the setpoint by
-a thin arc that shrinks as the bed converges. When Wi-Fi is down the clock
+The 270° arc opens at the bottom and is one temperature timeline: solid
+fill up to the mattress temperature, then a hashed span that marches slowly
+toward the target and shrinks as the bed converges. The cap sits at the
+target. When Wi-Fi is down the clock
 is replaced by "No Wi-Fi" and the arc turns grey; when the Pod is
 unreachable the status line says "Pod offline" and the arc's end cap is
 drawn hollow, the same cue used while a change is still unacknowledged.
 
 ### Controls
 
-Nothing on the main screen changes a value by touch. The two holds (power on
-the dial, settings on the screen) both show a progress ring.
+Nothing on the main screen changes a value by touch. The only touch targets
+are the power and gear glyphs beside the clock; the hold shows a progress ring.
 
 | Action | Result |
 |--------|--------|
 | **Rotate** | Adjust the active side's setpoint (1°F per detent; 2°F when spun) |
-| **Hold the dial 1s** | Toggle the side's power; a ring fills around the rim (red when it will turn off), release early to cancel |
+| **Click the dial** or **tap the power glyph** | Toggle the side's power |
 | **Rotate 2 detents below 55°F** | Also turns the side off (the OFF stop); any detent up turns it back on |
-| **Click the dial** | Switch side |
-| **Swipe left / right** | Switch side |
-| **Hold the screen 1.5s** | Open settings; a ring fills around the rim, release early to cancel |
+| **Hold the dial or screen 1.5s** or **tap the gear** | Open settings; a ring fills around the rim, release early to cancel |
+| **Settings > Side** | Choose Left or Right; it switches immediately and is remembered |
 | **Any input while dimmed** | Wakes the screen only (after the 3-second safe-wake arming) |
 
 ### Settings Menu
@@ -175,7 +175,7 @@ the dial, settings on the screen) both show a progress ring.
 | **Discover Pod** | Re-run mDNS discovery |
 | **Temperature Unit** | Toggle °F / °C display (a local choice sticks — Pod sync won't revert it) |
 | **Night Mode** | Cycle Auto / Forced On / Forced Off |
-| **Default Side** | Side selected at boot (doesn't switch the live side) |
+| **Side** | Which side this dial controls (switches immediately, remembered) |
 
 ## Architecture
 
