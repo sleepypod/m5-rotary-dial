@@ -26,7 +26,7 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **Power**: Click the dial or tap the power glyph. Two detents below 55°F also turn the side off; any detent up turns it back on
 - **Temperature Range**: 55°F to 110°F (matching Pod hardware limits)
 - **Visual Temperature Arc**: 270° gradient from cold-water blue through a body-neutral white to red-orange
-- **One timeline**: Solid fill is the mattress temperature; the hashed, slowly marching span is the distance still to travel to the target, like a loader
+- **One timeline**: Solid fill is the mattress temperature; the span up to the target sits dimmer with a soft highlight that travels toward the target, so you can see the bed is on its way
 
 ### sleepypod-core Integration
 - **mDNS Auto-Discovery**: Finds your Pod on the network automatically
@@ -63,7 +63,11 @@ The dial exposes its own API on port 80 for home automation:
 
 ## Screens
 
-Captured from the device with `tools/dial_shot.py`.
+Captured from the device with `tools/walkthrough.py`, which also records
+short clips of the animations into `docs/video/` and builds
+`docs/walkthrough.html`, a self-contained walkthrough page.
+
+![Turning](docs/video/turn.gif) ![Getting there](docs/video/loader.gif) ![Off and on](docs/video/power.gif) ![Holding](docs/video/settings.gif)
 
 | Heating | Cooling | At target | Off |
 |---|---|---|---|
@@ -146,8 +150,8 @@ To manually set the Pod IP:
 
 ```
         ┌───────────────────┐
-       ╱   Jon  ·  Heidi     ╲      ← side pair, underline marks the active side
-      │   ‾‾‾                 │
+       ╱        Jon           ╲      ← your side's name (Settings > Side)
+      │                       │
       │        82 °F          │      ← setpoint (DejaVu 56)
       │                       │
       │     heating · 69      │      ← mattress temperature and direction
@@ -157,9 +161,10 @@ To manually set the Pod IP:
 ```
 
 The 270° arc opens at the bottom and is one temperature timeline: solid
-fill up to the mattress temperature, then a hashed span that marches slowly
-toward the target and shrinks as the bed converges. The cap sits at the
-target. When Wi-Fi is down the clock
+fill up to the mattress temperature, then a dimmer span up to the target
+with a soft highlight that travels toward it and shrinks as the bed
+converges. The cap sits at the target. Only your side's name is shown; the
+side itself is chosen in Settings. When Wi-Fi is down the clock
 is replaced by "No Wi-Fi" and the arc turns grey; when the Pod is
 unreachable the status line says "Pod offline" and the arc's end cap is
 drawn hollow, the same cue used while a change is still unacknowledged.

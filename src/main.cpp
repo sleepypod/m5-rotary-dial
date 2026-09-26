@@ -208,7 +208,6 @@ struct Tween
   bool active = false;
 };
 Tween arcTween;       // arc fill angle
-Tween underlineTween; // active-side underline x
 unsigned long lastDetentTime = 0;
 
 // The encoder on GPIO 40/41 has no interrupt slot, so the library only
@@ -237,6 +236,10 @@ struct FlushJob
   bool powerOn[2];
 };
 QueueHandle_t httpQueue = nullptr;
+// The USB serial driver is not safe for two cores writing at once: the HTTP
+// worker logs while the loop may be streaming a framebuffer dump. Both take
+// this mutex around their output-heavy sections.
+SemaphoreHandle_t serialMutex = nullptr;
 volatile bool httpBusy = false;
 FlushJob httpFlushJob;
 volatile bool httpFlushDone = false;
@@ -248,7 +251,13 @@ void httpTask(void *);
 // Serial debug channel (see handleSerialDebug): simulated detents feed the
 // real encoder path so the OFF stop and acceleration are exercised too
 long simulatedEncoderDelta = 0;
-unsigned long debugHoldMs = 0; // draw the settings ring as if held this long (demo captures)
+// Demo clock: when frozen, every 'p' advances it by one 25fps frame before
+// rendering, so animations can be captured frame by frame over serial
+bool demoFrozen = false;
+unsigned long demoNow = 0;
+bool dumpAfterFrame = false;
+unsigned long debugHoldStart = 0; // simulated hold start on the UI clock (0 = none)
+unsigned long uiMillis() { return demoFrozen ? demoNow : millis(); }
 
 // Backlight fade
 float brightnessNow = BRIGHTNESS_DAY;
@@ -305,12 +314,13 @@ void setActivePower(bool on);
 void cycleSide(int direction);
 void openSettings();
 bool consumeSafeWake();
+unsigned long uiMillis();
 void noteDetent(unsigned long now, int &stepSize);
 void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now);
 float tweenValue(Tween &t, unsigned long now);
 float setpointAngle(int tempF);
 void buildArcTable();
-void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bool grey, const Theme &th);
+void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th);
 void flushPendingApi();
 void consumeHttpResults();
 void applyPodStatus(const PodStatus &status);
@@ -395,6 +405,7 @@ void setup()
   // Background tasks: encoder polling (core 1, above the loop) and Pod HTTP (core 0)
   xTaskCreatePinnedToCore(encoderTask, "encoder", 2048, nullptr, 3, nullptr, 1);
   httpQueue = xQueueCreate(2, sizeof(uint8_t));
+  serialMutex = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(httpTask, "podhttp", 12288, nullptr, 1, nullptr, 0);
 
   // Show startup message
@@ -419,7 +430,7 @@ void setup()
 
   // Get initial encoder position
   lastEncoderPosition = readEncoder();
-  lastActivityTime = millis();
+  lastActivityTime = uiMillis();
   wasNightMode = isNightTime();
   brightnessNow = wasNightMode ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY;
   brightnessTarget = brightnessNow;
@@ -435,7 +446,7 @@ void setup()
 void loop()
 {
   M5Dial.update();
-  unsigned long currentMillis = millis();
+  unsigned long currentMillis = uiMillis();
 
   handleSerialDebug();
 
@@ -443,6 +454,11 @@ void loop()
   handleEncoderInput();
   handleTouchInput();
   handleHold(currentMillis);
+  if (debugHoldStart && currentMillis - debugHoldStart >= SETTINGS_HOLD_MS)
+  {
+    debugHoldStart = 0;
+    if (!inSettingsMenu) openSettings();
+  }
 
   updateBrightness();
 
@@ -541,7 +557,7 @@ void loop()
     else
     {
       bool turning = (currentMillis - lastDetentTime) < 1000;
-      bool animating = arcTween.active || underlineTween.active || holdActive;
+      bool animating = arcTween.active || holdActive;
       // The hashed span marches only when the dial is at rest: rendering is
       // the loop's biggest cost and rotation needs the loop free
       bool breathing = !turning && isActivePowerOn() && podReachable && wifiConnected;
@@ -557,8 +573,11 @@ void loop()
         if (getLocalTime(&timeinfo) && timeinfo.tm_min != lastDrawnMinute) minuteChanged = true;
       }
       unsigned long frameInterval = turning ? 40 : (animating ? 16 : (breathing ? 100 : 1000));
-      if ((uiDirty || animating || breathing || minuteChanged) &&
-          currentMillis - lastFrameTime >= frameInterval)
+      // Frozen demo clock: render exactly one frame per 'p', nothing else
+      bool wantFrame = demoFrozen ? dumpAfterFrame
+                                  : ((uiDirty || animating || breathing || minuteChanged) &&
+                                     currentMillis - lastFrameTime >= frameInterval);
+      if (wantFrame)
       {
         uiDirty = false;
         lastFrameTime = currentMillis;
@@ -569,6 +588,12 @@ void loop()
         frameCount++;
       }
     }
+  }
+
+  if (dumpAfterFrame)
+  {
+    dumpAfterFrame = false;
+    dumpScreen();
   }
 
   delay(1);
@@ -682,7 +707,7 @@ void setupMDNS()
 bool consumeSafeWake()
 {
   if (!isDimmed) return false;
-  bool armed = (millis() - dimmedAt) >= SAFE_WAKE_ARM_MS;
+  bool armed = (uiMillis() - dimmedAt) >= SAFE_WAKE_ARM_MS;
   recordActivity();
   return armed;
 }
@@ -708,7 +733,7 @@ void applySetpoint(int newTemp)
   pendingTemp[activeSide == SIDE_RIGHT ? 1 : 0] = true;
   Serial.printf("Setpoint %s -> %d°F\n", activeSide == SIDE_RIGHT ? "right" : "left", newTemp);
 
-  lastSetpointChangeTime = millis();
+  lastSetpointChangeTime = uiMillis();
   pendingApiUpdate = true;
   drawTemperatureUI();
 }
@@ -729,14 +754,14 @@ void setActivePower(bool on)
   }
   Serial.printf("Power %s\n", on ? "ON" : "OFF");
   feedbackBeep(on ? 2600 : 1800);
-  lastSetpointChangeTime = millis();
+  lastSetpointChangeTime = uiMillis();
   pendingApiUpdate = true;
   drawTemperatureUI();
 }
 
 void cycleSide(int direction)
 {
-  unsigned long now = millis();
+  unsigned long now = uiMillis();
   float fromAngle = tweenValue(arcTween, now);
 
   (void)direction; // two sides: any switch is a toggle
@@ -785,7 +810,7 @@ void handleEncoderInput()
   if (diff != 0)
   {
     lastEncoderPosition = newPosition;
-    unsigned long now = millis();
+    unsigned long now = uiMillis();
 
     if (consumeSafeWake()) return;
     recordActivity();
@@ -1167,11 +1192,14 @@ void buildArcTable()
 }
 
 // Writes the track and the fill straight into the sprite buffer. Angles are
-// absolute (ARC_START..ARC_START+ARC_SPAN). Solid gradient up to solidAngle;
-// between hashFrom and hashTo the gradient is hashed (8° period, marching
-// by phase10) to read as "still travelling". Pass solidAngle < ARC_START for
-// no fill. grey draws in the muted colour (Wi-Fi down: the arc is stale).
-void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bool grey, const Theme &th)
+// absolute (ARC_START..ARC_START+ARC_SPAN). Solid gradient up to solidAngle.
+// Between spanFrom and spanTo the gradient sits at 40% ("not yet") with a
+// soft gaussian highlight centred at glow10 (relative 0.1°, <0 for none,
+// width sigma10) travelling toward the target; when the span is too short
+// for a blob, the whole span pulses by `pulse` (0..1) instead. Pass
+// solidAngle < ARC_START for no fill. grey draws in the muted colour
+// (Wi-Fi down: the arc is stale).
+void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th)
 {
   if (!arcTable) return;
   if (gradientLutNight != (int)th.night)
@@ -1180,8 +1208,11 @@ void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bo
     gradientLutNight = (int)th.night;
   }
   int solid10 = (int)((solidAngle - ARC_START) * 10.0f);
-  int hash0 = (int)((hashFrom - ARC_START) * 10.0f);
-  int hash1 = (int)((hashTo - ARC_START) * 10.0f);
+  int span0 = (int)((spanFrom - ARC_START) * 10.0f);
+  int span1 = (int)((spanTo - ARC_START) * 10.0f);
+  const float baseMix = glow10 >= 0 ? 0.40f : (0.35f + 0.65f * pulse);
+  const float inv2s2 = sigma10 > 0 ? 1.0f / (2.0f * (float)sigma10 * (float)sigma10) : 0.0f;
+  const int reach = sigma10 * 3;
   uint16_t *buf = (uint16_t *)sprite.getBuffer();
   const uint16_t bg = th.bg;
   for (int i = 0; i < arcTableLen; i++)
@@ -1194,11 +1225,17 @@ void drawArcRing(float solidAngle, float hashFrom, float hashTo, int phase10, bo
     {
       c = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
     }
-    else if (a10 > hash0 && a10 <= hash1)
+    else if (a10 > span0 && a10 <= span1)
     {
       uint16_t g = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
-      int stripe = ((a10 - hash0 + phase10 + 8000) / 40) & 1; // 4° on, 4° off
-      c = stripe ? lerp565(th.track, g, 0.35f) : g;
+      float mix = baseMix;
+      if (glow10 >= 0)
+      {
+        int d = a10 - glow10;
+        if (d < 0) d = -d;
+        if (d < reach) mix += (1.0f - baseMix) * expf(-(float)(d * d) * inv2s2);
+      }
+      c = lerp565(bg, g, mix);
     }
     else
     {
@@ -1239,19 +1276,42 @@ void renderMainScreen(unsigned long now)
   int diff = shownF - currentF;
   bool converging = powerOn && online && abs(diff) > 1;
   float solidAngle = powerOn ? fillAngle : ARC_START - 1.0f;
-  float hashFrom = ARC_START - 1.0f, hashTo = ARC_START - 1.0f;
-  int phase10 = 0;
+  float spanFrom = ARC_START - 1.0f, spanTo = ARC_START - 1.0f;
+  int glow10 = -1, sigma10 = 0;
+  float pulse = 0.0f;
   if (converging)
   {
     float curAngle = setpointAngle(currentF);
     solidAngle = fminf(curAngle, fillAngle);
-    hashFrom = solidAngle;
-    hashTo = fmaxf(curAngle, fillAngle);
-    // March toward the target: 8° period over 4 s, direction follows heating/cooling
-    int p = (int)((now / 50) % 80);
-    phase10 = (diff > 0) ? (80 - p) : p;
+    spanFrom = solidAngle;
+    spanTo = fmaxf(curAngle, fillAngle);
+    // Shimmer: a soft highlight travels from the mattress temperature toward
+    // the target (both directions), eases in and out, then rests before
+    // restarting. Too short a span for a blob pulses instead.
+    const unsigned long travel = th.night ? 4000 : 2600, rest = 400;
+    unsigned long t = now % (travel + rest);
+    if (spanTo - spanFrom >= 24.0f)
+    {
+      if (t < travel)
+      {
+        float p = (float)t / (float)travel;
+        p = -(cosf(PI * p) - 1.0f) / 2.0f; // ease-in-out sine
+        float pos = curAngle + (fillAngle - curAngle) * p;
+        glow10 = (int)((pos - ARC_START) * 10.0f);
+      }
+      else
+      {
+        glow10 = 0x7FFF; // resting: base only, no highlight anywhere
+      }
+      sigma10 = th.night ? 80 : 60;
+    }
+    else
+    {
+      float ph = (float)(now % 2400) / 2400.0f;
+      pulse = 0.5f + 0.5f * sinf(ph * 2.0f * PI);
+    }
   }
-  drawArcRing(solidAngle, hashFrom, hashTo, phase10, !wifiConnected, th);
+  drawArcRing(solidAngle, spanFrom, spanTo, glow10, sigma10, pulse, !wifiConnected, th);
   uint16_t fillDim = th.muted;
   {
     int x, y;
@@ -1275,37 +1335,13 @@ void renderMainScreen(unsigned long now)
   }
 
   sectUs[0] = micros() - tS; tS = micros();
-  // ---- Side pair at the top ----
+  // ---- Your side's name at the top ----
   {
-    String ln = fitText(leftSideName, 8);
-    String rn = fitText(rightSideName, 8);
+    String name = fitText(activeSide == SIDE_RIGHT ? rightSideName : leftSideName, 10);
     sprite.setFont(&fonts::FreeSans9pt7b);
-    int wl = sprite.textWidth(ln.c_str());
-    int wr = sprite.textWidth(rn.c_str());
-    const int gap = 22;
-    int x0 = centerX - (wl + gap + wr) / 2;
-    int lcx = x0 + wl / 2;
-    int rcx = x0 + wl + gap + wr / 2;
-    const int y = 50;
-
-    bool lActive = activeSide == SIDE_LEFT;
-    bool rActive = activeSide == SIDE_RIGHT;
     sprite.setTextDatum(middle_center);
-    sprite.setTextColor(lActive ? th.text : (leftPowerOn ? th.secondary : th.muted));
-    sprite.drawString(ln.c_str(), lcx, y);
-    sprite.setTextColor(rActive ? th.text : (rightPowerOn ? th.secondary : th.muted));
-    sprite.drawString(rn.c_str(), rcx, y);
-    sprite.fillSmoothCircle(x0 + wl + gap / 2, y, 1, th.muted);
-
-    // Underline slides to the active name
-    float targetX = activeSide == SIDE_LEFT ? lcx : rcx;
-    if (underlineTween.to == 0) underlineTween.to = targetX;
-    if (!underlineTween.active && underlineTween.to != targetX)
-    {
-      tweenStart(underlineTween, underlineTween.to, targetX, SIDE_SWITCH_MS, now);
-    }
-    float ux = tweenValue(underlineTween, now);
-    sprite.fillSmoothRoundRect((int)(ux - 11), 60, 22, 2, 1, th.text);
+    sprite.setTextColor(powerOn ? th.secondary : th.muted);
+    sprite.drawString(name.c_str(), centerX, 50);
   }
 
   sectUs[1] = micros() - tS; tS = micros();
@@ -1389,9 +1425,9 @@ void renderMainScreen(unsigned long now)
   }
 
   // ---- Settings hold ring (outside the arc) ----
-  if ((holdActive && !holdConsumed) || debugHoldMs)
+  if ((holdActive && !holdConsumed) || debugHoldStart)
   {
-    unsigned long held = debugHoldMs ? debugHoldMs : now - holdStartTime;
+    unsigned long held = debugHoldStart ? now - debugHoldStart : now - holdStartTime;
     if (held >= HOLD_RING_SHOW_MS)
     {
       float p = (float)(held - HOLD_RING_SHOW_MS) / (float)(SETTINGS_HOLD_MS - HOLD_RING_SHOW_MS);
@@ -2132,7 +2168,8 @@ void handleEncoderInPasswordEntry()
 //   n      cycle night override     z  force dim now        w  wake
 //   p      dump the framebuffer as hex (240 rows of RGB565)
 //   h / l  fake the mattress 9°F below / above the setpoint (heating / cooling)
-//   a      fake the mattress at the setpoint    H  draw the settings ring half full
+//   a      fake the mattress at the setpoint    H  start a simulated hold (ring fills)
+//   T / t  freeze / unfreeze the UI clock; frozen, each p advances one 25fps frame and dumps
 //   S / x  open / close the settings menu       f  frame timing
 void handleSerialDebug()
 {
@@ -2150,22 +2187,30 @@ void handleSerialDebug()
       Serial.printf("night override -> %d\n", (int)nightOverride);
       drawTemperatureUI();
       break;
-    case 'z': lastActivityTime = millis() - DIM_TIMEOUT_MS - 1; break;
-    case 'w': recordActivity(); debugHoldMs = 0; drawTemperatureUI(); break;
+    case 'z': lastActivityTime = uiMillis() - DIM_TIMEOUT_MS - 1; break;
+    case 'w': recordActivity(); debugHoldStart = 0; drawTemperatureUI(); break;
     case 'h': case 'l': case 'a':
     {
       // Local only; the 30s sync hold-off keeps the Pod from correcting it at once
       int &cur = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
       int off = (c == 'h') ? -9 : (c == 'l' ? 9 : 0);
       cur = getDisplaySetpoint() + off;
-      lastActivityTime = millis();
+      lastActivityTime = uiMillis();
       drawTemperatureUI();
       break;
     }
-    case 'H': debugHoldMs = HOLD_RING_SHOW_MS + (SETTINGS_HOLD_MS - HOLD_RING_SHOW_MS) / 2; drawTemperatureUI(); break;
+    case 'H': debugHoldStart = uiMillis(); recordActivity(); drawTemperatureUI(); break;
     case 'S': if (!inSettingsMenu) { recordActivity(); openSettings(); } break;
     case 'x': if (inSettingsMenu) { inSettingsMenu = false; currentSubMenu = SUBMENU_NONE; lastEncoderPosition = readEncoder(); drawTemperatureUI(); } break;
-    case 'p': dumpScreen(); break;
+    case 'p':
+      if (demoFrozen) { demoNow += 40; uiDirty = true; dumpAfterFrame = true; }
+      else dumpScreen();
+      break;
+    case 'T': case 't':
+      demoFrozen = (c == 'T');
+      if (demoFrozen) demoNow = millis();
+      Serial.printf("demo clock %s\n", demoFrozen ? "frozen" : "live");
+      break;
     case 'f':
       Serial.printf("frame last=%luus max=%luus n=%lu heap=%u arc=%lu marker=%lu text=%lu push=%lu\n",
                     (unsigned long)frameUsLast, (unsigned long)frameUsMax,
@@ -2184,6 +2229,7 @@ void dumpScreen()
   const uint16_t *buf = (const uint16_t *)sprite.getBuffer();
   static const char hex[] = "0123456789abcdef";
   char line[SCREEN_WIDTH * 4 + 1];
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
   Serial.println("<<FB>>");
   for (int y = 0; y < SCREEN_HEIGHT; y++)
   {
@@ -2199,6 +2245,7 @@ void dumpScreen()
     Serial.println(line);
   }
   Serial.println("<<END>>");
+  xSemaphoreGive(serialMutex);
 }
 
 // ==================== Utility ====================
@@ -2282,7 +2329,7 @@ bool isNightTime()
 
 void recordActivity()
 {
-  lastActivityTime = millis();
+  lastActivityTime = uiMillis();
   if (isDimmed)
   {
     isDimmed = false;
@@ -2296,7 +2343,7 @@ void recordActivity()
 // the low end doesn't collapse in the first few milliseconds.
 void updateBrightness()
 {
-  unsigned long now = millis();
+  unsigned long now = uiMillis();
   unsigned long timeSinceActivity = now - lastActivityTime;
   unsigned long dimTimeout = isNightTime() ? DIM_TIMEOUT_NIGHT_MS : DIM_TIMEOUT_MS;
   uint8_t targetBrightness;
@@ -2409,6 +2456,7 @@ void httpTask(void *)
   {
     uint8_t kind = 0;
     if (xQueueReceive(httpQueue, &kind, portMAX_DELAY) != pdTRUE) continue;
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
 
     if (kind == HTTP_JOB_FLUSH)
     {
@@ -2428,6 +2476,7 @@ void httpTask(void *)
       httpSyncResult = fetchPodStatus(podIP, podPort);
       httpSyncDone = true;
     }
+    xSemaphoreGive(serialMutex);
     httpBusy = false;
   }
 }

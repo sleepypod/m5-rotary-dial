@@ -141,8 +141,8 @@ flowchart LR
     end
 
     subgraph "UI Layers"
-        Arc["Arc 135°-405°: solid to mattress temp,<br/>hashed marching span to target, hollow cap while unconfirmed"] --> Sprite
-        Sides["Side pair + underline (preference)"] --> Sprite
+        Arc["Arc 135°-405°: solid to mattress temp,<br/>dim span with travelling highlight to target,<br/>hollow cap while unconfirmed"] --> Sprite
+        Sides["Your side's name (preference)"] --> Sprite
         Center["Setpoint numeral + unit + status line"] --> Sprite
         Clock["Power glyph · clock · gear glyph / No Wi-Fi"] --> Sprite
         Ring["Settings hold ring"] --> Sprite
@@ -151,9 +151,9 @@ flowchart LR
 
 The encoder is polled by a 1ms FreeRTOS task (its GPIOs have no interrupt slot), and all Pod HTTP runs on a worker task on core 0; the loop hands it one flush or sync job at a time and folds the result back in on a later pass, so a slow Pod never blocks input or rendering.
 
-All rendering goes through one full-screen LGFX_Sprite. The loop only renders a frame when state changed, a tween is active (arc settle 180ms, side switch 220ms, hold ring), the hashed span is marching (10fps), or the minute changed. Backlight changes fade in perceptual (sqrt) space. The dim state is a separate, minimal render: numeral plus one status dot.
+All rendering goes through one full-screen LGFX_Sprite. The loop only renders a frame when state changed, a tween is active (arc settle 180ms, side switch 220ms, hold ring), the highlight is travelling (10fps), or the minute changed. Backlight changes fade in perceptual (sqrt) space. The dim state is a separate, minimal render: numeral plus one status dot.
 
-Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encoder path, `c` click, `o` power, `n` night override, `z` dim, `w` wake, `p` dump the framebuffer as hex. `tools/dial_shot.py <out.png> [cmds...]` drives this and writes a PNG.
+Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encoder path, `c` click, `o` power, `n` night override, `z` dim, `w` wake, `p` dump the framebuffer as hex. `tools/dial_shot.py <out.png> [cmds...]` drives this and writes a PNG. `T`/`t` freeze/unfreeze the UI clock; frozen, each `p` advances one 25fps frame; `tools/walkthrough.py` uses that to record the animation clips.
 
 ## State Management
 
