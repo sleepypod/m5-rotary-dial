@@ -2,7 +2,7 @@
 
 ## System Overview
 
-The sleepypod MT Rotary Dial is an M5Stack Dial (ESP32-S3) firmware that controls an Eight Sleep Pod via [sleepypod-core](https://github.com/your-org/sleepypod-core) APIs over the local network. It provides a physical rotary interface for temperature control, side switching, and power management.
+The sleepypod MT Rotary Dial is an M5Stack Dial (ESP32-S3) firmware that controls a Pod via [sleepypod-core](https://github.com/your-org/sleepypod-core) APIs over the local network. It provides a physical rotary interface for temperature control, side switching, and power management.
 
 > Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial), adapted from FreeSleep to sleepypod-core APIs.
 
@@ -12,7 +12,7 @@ The sleepypod MT Rotary Dial is an M5Stack Dial (ESP32-S3) firmware that control
 graph LR
     subgraph LAN["Local Network (RFC 1918)"]
         Dial["M5Stack Dial<br/>sleepypod-dial.local"]
-        Pod["Eight Sleep Pod<br/>sleepypod-core<br/>:3000 HTTP"]
+        Pod["Pod<br/>sleepypod-core<br/>:3000 HTTP"]
         Phone["iOS App"]
         HA["Home Automation<br/>(optional)"]
     end

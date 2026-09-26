@@ -7,7 +7,7 @@
 <p align="center"><strong>One arc. One number. Nothing to learn in the dark.</strong></p>
 
 <p align="center">
-A bedside knob for the Eight Sleep Pod, built on the <a href="https://shop.m5stack.com/products/m5stack-dial-esp32-s3-smart-rotary-knob-w-1-28-round-touch-screen">M5Stack Dial</a> and talking to <a href="https://github.com/throwaway31265/free-sleep">sleepypod-core</a> on your own network.<br>
+A bedside knob for your Pod, built on the <a href="https://shop.m5stack.com/products/m5stack-dial-esp32-s3-smart-rotary-knob-w-1-28-round-touch-screen">M5Stack Dial</a> and talking to <a href="https://github.com/sleepypod/core">sleepypod-core</a> on your own network.<br>
 It shows where your mattress is, where it is going, and lets you turn it, click it off, and leave it alone.
 </p>
 
@@ -108,8 +108,8 @@ brew install platformio
 ### 2. Clone & Configure
 
 ```bash
-git clone https://github.com/your-org/sleepypod-mt-rotary-dial.git
-cd sleepypod-mt-rotary-dial
+git clone https://github.com/sleepypod/m5-rotary-dial.git
+cd m5-rotary-dial
 
 # Set your WiFi credentials
 cp include/credentials.h.example include/credentials.h
@@ -207,7 +207,7 @@ See [docs/architecture.md](docs/architecture.md) for detailed system diagrams in
 ## Acknowledgments
 
 - **[dallonby/RotaryDial](https://github.com/dallonby/RotaryDial)** — Original FreeSleep rotary dial controller. This project is built on their excellent work adapting the M5Stack Dial for bed temperature control.
-- **[free-sleep](https://github.com/throwaway31265/free-sleep)** — Open source Eight Sleep Pod control
+- **[free-sleep](https://github.com/throwaway31265/free-sleep)** — Open source Pod control
 - **[M5Stack](https://m5stack.com/)** — M5Stack Dial hardware
 - **[PlatformIO](https://platformio.org/)** — Build system
 
