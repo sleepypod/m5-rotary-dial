@@ -80,7 +80,7 @@ Nothing on the main screen changes a value by touch. Rotation is always silent (
 - **Night mode that stays out of the way.** Red-only theme 10 pm to 7 am at 20% brightness, dims to 1% after five seconds, fades instead of stepping. Override it in Settings.
 - **Reliable.** Daily restart follows the Pod's own reboot schedule, and a watchdog reboots the dial if the UI loop ever stalls.
 
-Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial). There is also a self-contained walkthrough page at [`docs/walkthrough.html`](docs/walkthrough.html).
+Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial). For the full feature reference, API integration, and the detailed controls table see [`docs/features.md`](docs/features.md); for boot, loop, rendering and state diagrams see [`docs/architecture.md`](docs/architecture.md). There is also a self-contained walkthrough page at [`docs/walkthrough.html`](docs/walkthrough.html).
 
 ---
 
