@@ -139,6 +139,15 @@ Edit `include/config.h`:
 pio run --target upload
 ```
 
+### Tests
+
+The hardware-free core (`src/dial_logic.cpp`: temperature maths, arc geometry and colour, detent acceleration, the OFF stop, the loader shimmer, Pod JSON parsing) has host-side Unity tests. No device needed:
+
+```bash
+pio test -e native
+gcovr -r . --filter src/ --xml-pretty -o coverage.xml   # pip install gcovr
+```
+
 ### 5. Configure Pod Connection
 
 On first boot, the dial will:
