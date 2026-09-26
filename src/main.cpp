@@ -20,6 +20,7 @@
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 #include <time.h>
 #include "config.h"
 #include "sleepypod_api.h"
@@ -402,6 +403,10 @@ void setup()
   // Touch: a flick must travel a bit before it counts as a swipe
   M5Dial.Touch.setFlickThresh(16);
 
+  // If the UI loop ever stalls for 10s, panic (backtrace on serial) and reboot
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+
   // Background tasks: encoder polling (core 1, above the loop) and Pod HTTP (core 0)
   xTaskCreatePinnedToCore(encoderTask, "encoder", 2048, nullptr, 3, nullptr, 1);
   httpQueue = xQueueCreate(2, sizeof(uint8_t));
@@ -445,6 +450,7 @@ void setup()
 
 void loop()
 {
+  esp_task_wdt_reset();
   M5Dial.update();
   unsigned long currentMillis = uiMillis();
 
@@ -2166,7 +2172,7 @@ void handleEncoderInPasswordEntry()
 // inspected without touching the device:
 //   + / -  one detent up / down     c  click (switch side)  o  toggle power
 //   n      cycle night override     z  force dim now        w  wake
-//   p      dump the framebuffer as hex (240 rows of RGB565)
+//   p      dump the framebuffer (run-length encoded RGB565 hex)
 //   h / l  fake the mattress 9°F below / above the setpoint (heating / cooling)
 //   a      fake the mattress at the setpoint    H  start a simulated hold (ring fills)
 //   T / t  freeze / unfreeze the UI clock; frozen, each p advances one 25fps frame and dumps
@@ -2224,24 +2230,43 @@ void handleSerialDebug()
   }
 }
 
+// Framebuffer dump: run-length encoded RGB565 as hex "ccvvvv" pairs (cc =
+// run length 1..255, vvvv = pixel as stored). The screen is mostly
+// background, so this is ~10x less serial traffic than raw pixels, which
+// matters because the USB-CDC driver wedges under sustained full-speed output.
 void dumpScreen()
 {
   const uint16_t *buf = (const uint16_t *)sprite.getBuffer();
   static const char hex[] = "0123456789abcdef";
-  char line[SCREEN_WIDTH * 4 + 1];
+  char line[6 * 64 + 1];
+  int col = 0;
+  const int total = SCREEN_WIDTH * SCREEN_HEIGHT;
   xSemaphoreTake(serialMutex, portMAX_DELAY);
   Serial.println("<<FB>>");
-  for (int y = 0; y < SCREEN_HEIGHT; y++)
+  int i = 0;
+  while (i < total)
   {
-    for (int x = 0; x < SCREEN_WIDTH; x++)
+    uint16_t v = buf[i];
+    int run = 1;
+    while (i + run < total && run < 255 && buf[i + run] == v) run++;
+    line[col++] = hex[(run >> 4) & 0xF];
+    line[col++] = hex[run & 0xF];
+    line[col++] = hex[(v >> 12) & 0xF];
+    line[col++] = hex[(v >> 8) & 0xF];
+    line[col++] = hex[(v >> 4) & 0xF];
+    line[col++] = hex[v & 0xF];
+    i += run;
+    if (col >= 6 * 64)
     {
-      uint16_t v = buf[y * SCREEN_WIDTH + x];
-      line[x * 4 + 0] = hex[(v >> 12) & 0xF];
-      line[x * 4 + 1] = hex[(v >> 8) & 0xF];
-      line[x * 4 + 2] = hex[(v >> 4) & 0xF];
-      line[x * 4 + 3] = hex[v & 0xF];
+      line[col] = 0;
+      Serial.println(line);
+      col = 0;
+      delay(1); // let the USB driver drain between lines
     }
-    line[SCREEN_WIDTH * 4] = 0;
+  }
+  if (col)
+  {
+    line[col] = 0;
     Serial.println(line);
   }
   Serial.println("<<END>>");

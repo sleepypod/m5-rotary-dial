@@ -12,24 +12,25 @@ for c in cmds:
 time.sleep(0.6)
 s.reset_input_buffer()
 s.write(b'p'); s.flush()
-rows=[]; started=False; t=time.time()
-while time.time()-t<40:
-    line=s.readline().decode(errors='replace').strip()
-    if not line: continue
-    if line=='<<FB>>': started=True; continue
-    if line=='<<END>>': break
-    if started and len(line)==960: rows.append(line)
-    elif started: print('bad row', len(line))
-print('rows', len(rows))
+buf=bytearray(); t=time.time()
+while time.time()-t<30:
+    c=s.read(65536)
+    if c:
+        buf+=c
+        if b'<<END>>' in buf: break
+text=buf.decode(errors='replace')
+body=text.split('<<FB>>',1)[1].split('<<END>>',1)[0]
+hexs=''.join(body.split())
 W,H=240,240
-raw=bytearray()
-for r in rows:
-    raw.append(0)
-    for x in range(W):
-        v=int(r[x*4:x*4+4],16)
-        v=((v&0xFF)<<8)|(v>>8)   # sprite stores RGB565 byte-swapped
-        R=((v>>11)&0x1F)*255//31; G=((v>>5)&0x3F)*255//63; B=(v&0x1F)*255//31
-        raw += bytes((R,G,B))
+raw=bytearray(); n=0
+for i in range(0,len(hexs),6):
+    run=int(hexs[i:i+2],16); v=int(hexs[i+2:i+6],16)
+    v=((v&0xFF)<<8)|(v>>8)   # sprite stores RGB565 byte-swapped
+    rgb=bytes((((v>>11)&0x1F)*255//31,((v>>5)&0x3F)*255//63,(v&0x1F)*255//31))
+    for _ in range(run):
+        if n%W==0: raw.append(0)
+        raw+=rgb; n+=1
+print('pixels',n)
 def chunk(t,d): return struct.pack('>I',len(d))+t+d+struct.pack('>I',zlib.crc32(t+d)&0xffffffff)
-png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',W,len(rows),8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw)))+chunk(b'IEND',b'')
+png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',W,H,8,2,0,0,0))+chunk(b'IDAT',zlib.compress(bytes(raw)))+chunk(b'IEND',b'')
 open(out,'wb').write(png); print('wrote',out)

@@ -21,6 +21,35 @@ NO_VIDEO = "--no-video" in sys.argv
 ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None  # capture one clip, no page
 
 
+
+def decode_frame(text):
+    """Decode a run-length encoded dump (hex 'ccvvvv' pairs) into PNG bytes."""
+    hexs = "".join(text.split())
+    px = []
+    total = W * H
+    for i in range(0, len(hexs), 6):
+        run = int(hexs[i:i + 2], 16)
+        v = int(hexs[i + 2:i + 6], 16)
+        v = ((v & 0xFF) << 8) | (v >> 8)  # sprite stores RGB565 byte-swapped
+        px.append((run, bytes((((v >> 11) & 0x1F) * 255 // 31, ((v >> 5) & 0x3F) * 255 // 63, (v & 0x1F) * 255 // 31))))
+    raw = bytearray()
+    n = 0
+    for run, rgb in px:
+        for _ in range(run):
+            if n % W == 0:
+                raw.append(0)
+            raw += rgb
+            n += 1
+    if n != total:
+        raise RuntimeError(f"decoded {n} px, expected {total}")
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
+
+
 class Dial:
     def __init__(self):
         self.s = serial.Serial(PORT, 115200, timeout=2)
@@ -54,33 +83,31 @@ class Dial:
         self.s.reset_input_buffer()
 
     def _frame(self):
-        self.s.reset_input_buffer()
+        """Request a dump and read the byte stream until the end marker.
+        Bytes are accumulated (not read line by line) so a pause on the device
+        side, e.g. while the HTTP worker holds the serial mutex, cannot split a
+        line. Anything before the start marker is firmware logging."""
         self.s.write(b"p")
         self.s.flush()
-        rows, started, t = [], False, time.time()
-        while time.time() - t < 40 and len(rows) < H:
-            line = self.s.readline().decode(errors="replace").strip()
-            if line == "<<FB>>":
-                started = True
-            elif line == "<<END>>":
-                break
-            elif started and len(line) == W * 4:
-                rows.append(line)
-        if len(rows) != H:
-            raise RuntimeError(f"short frame: {len(rows)} rows")
-        raw = bytearray()
-        for r in rows:
-            raw.append(0)
-            for x in range(W):
-                v = int(r[x * 4:x * 4 + 4], 16)
-                v = ((v & 0xFF) << 8) | (v >> 8)  # sprite stores RGB565 byte-swapped
-                raw += bytes((((v >> 11) & 0x1F) * 255 // 31, ((v >> 5) & 0x3F) * 255 // 63, (v & 0x1F) * 255 // 31))
-
-        def chunk(tag, data):
-            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-
-        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-                + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
+        buf = bytearray()
+        t = time.time()
+        while time.time() - t < 30:
+            chunk = self.s.read(65536)
+            if chunk:
+                buf += chunk
+                if b"<<END>>" in buf:
+                    break
+        text = buf.decode(errors="replace")
+        if "<<FB>>" not in text or "<<END>>" not in text:
+            for l in text.splitlines()[-6:]:
+                print("serial:", l[:160], file=sys.stderr)
+            raise RuntimeError(f"no frame ({len(buf)} bytes)")
+        head, rest = text.split("<<FB>>", 1)
+        for l in head.splitlines():
+            if l.strip():
+                print("serial:", l[:160], file=sys.stderr)
+        body = rest.split("<<END>>", 1)[0]
+        return decode_frame(body)
 
     def still(self, name, cmds):
         self.send(cmds)
