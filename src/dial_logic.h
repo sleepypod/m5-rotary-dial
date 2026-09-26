@@ -1,0 +1,125 @@
+#ifndef DIAL_LOGIC_H
+#define DIAL_LOGIC_H
+
+// Hardware-free core of the dial: temperature maths, arc geometry and
+// colour, detent acceleration, the OFF stop, the loader shimmer, and Pod
+// JSON parsing. Plain C++17, no Arduino. main.cpp and sleepypod_api.cpp call
+// into this; test/test_logic exercises it on the host.
+
+#include <stdint.h>
+#include <stddef.h>
+#include "config.h"
+
+// ==================== Temperature ====================
+
+int clampTemperatureF(int tempF);
+bool isValidSetpointF(int tempF);
+float fahrenheitToCelsius(float f);
+float celsiusToFahrenheit(float c);
+
+// ==================== Arc geometry ====================
+
+// LovyanGFX angles: 0° = 3 o'clock, clockwise. The arc opens at the bottom.
+constexpr float ARC_START = 135.0f; // bottom-left
+constexpr float ARC_SPAN = 270.0f;  // opening centred at the bottom
+
+float setpointAngle(int tempF);
+int angleSetpoint(float angle); // inverse, rounded to the nearest °F
+
+// ==================== Colour ====================
+
+uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b);
+uint16_t lerp565(uint16_t a, uint16_t b, float t);
+// Arc gradient at percent (0..1 along the arc). Day: five perceptual stops
+// from cold-water blue through warm white to red-orange. Night: two-stop red.
+uint16_t arcColor(float percent, bool night);
+
+// ==================== Detent acceleration ====================
+
+// Three detents inside ACCEL_WINDOW_MS means the user is spinning: step 2°F.
+// Capped at 2 so a spin never overshoots by twenty degrees.
+struct DetentAccel
+{
+  unsigned long times[3] = {0, 0, 0};
+  uint8_t idx = 0;
+  int note(unsigned long now); // returns the step for this detent (1 or 2)
+  void reset();
+};
+
+// ==================== OFF stop ====================
+
+enum OffStopAction
+{
+  OFFSTOP_IGNORE = 0, // side is off, detent went down: nothing
+  OFFSTOP_ADJUST,     // normal detent: apply currentF + dir * step
+  OFFSTOP_COUNTING,   // below minimum, OFF stop not reached yet (show hint)
+  OFFSTOP_TURN_OFF,   // OFF_DETENTS reached below the minimum
+  OFFSTOP_TURN_ON     // side was off, any detent up turns it back on
+};
+
+struct OffStop
+{
+  int accum = 0;
+  OffStopAction detent(bool powerOn, int currentF, int dir);
+  void reset();
+};
+
+// ==================== Loader shimmer ====================
+
+// A soft highlight travels along the span (spanFrom..spanTo, absolute
+// degrees) in the arc's own direction, eases in and out, rests, restarts.
+// Too short a span for a blob pulses instead.
+struct ShimmerParams
+{
+  int glow10 = -1;    // highlight centre relative to ARC_START in 0.1°; <0 none; SHIMMER_RESTING while resting
+  int sigma10 = 0;    // highlight width in 0.1°
+  float pulse = 0.0f; // 0..1 whole-span pulse when the span is too short
+};
+constexpr int SHIMMER_RESTING = 0x7FFF;
+constexpr float SHIMMER_MIN_SPAN_DEG = 24.0f;
+ShimmerParams shimmerAt(unsigned long now, float spanFrom, float spanTo, bool night);
+
+// ==================== Pod JSON ====================
+
+struct SideStatus
+{
+  int targetTemperatureF; // 55-110 (0 when the Pod reports the side off)
+  int currentTemperatureF;
+  bool isPowered;
+  bool valid; // true if successfully parsed
+};
+
+struct PodStatus
+{
+  SideStatus left;
+  SideStatus right;
+  bool success; // true if the payload parsed and had at least one side
+};
+
+constexpr size_t POD_NAME_MAX = 32; // including the terminator
+
+struct PodSettings
+{
+  char leftName[POD_NAME_MAX];  // Display name for left side (e.g., "Nick")
+  char rightName[POD_NAME_MAX]; // Display name for right side (e.g., "Partner")
+  char temperatureUnit[4];      // "F" or "C"
+  bool rebootDaily;             // Whether Pod reboots daily
+  char rebootTime[8];           // HH:mm format
+  bool success;
+};
+
+// GET /api/device/status body -> PodStatus. On a JSON error success is
+// false and *error (if given) names it.
+PodStatus parsePodStatus(const char *json, const char **error = nullptr);
+
+// GET /api/settings body -> PodSettings with defaults for missing fields.
+PodSettings parsePodSettings(const char *json, const char **error = nullptr);
+
+// The Pod reports target 0 for a side that is off (and may send other
+// out-of-range values); only an in-range target replaces the local setpoint.
+int mergeSetpoint(int localSetpointF, const SideStatus &side);
+
+// "HH:mm" -> hour, or fallback when the string is too short to hold one.
+int parseRebootHour(const char *hhmm, int fallback);
+
+#endif // DIAL_LOGIC_H

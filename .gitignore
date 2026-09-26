@@ -26,6 +26,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Coverage (pio test -e native + gcovr)
+coverage.xml
+
 # Credentials
 include/credentials.h
 .reviews/
