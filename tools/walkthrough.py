@@ -250,7 +250,7 @@ def write_page(stills, clips):
         if not clips.get(k):
             return ""
         src = b64("video/mp4", clips[k])
-        return (f'<article class="slide"><div class="device"><video src="{src}" autoplay muted loop playsinline width="240" height="240"></video></div>'
+        return (f'<article class="slide"><div class="device"><video src="{src}" muted loop playsinline width="240" height="240"></video></div>'
                 f'<div class="cap"><h3>{title}</h3><p>{text}</p></div></article>')
 
     videos = "".join([
@@ -324,7 +324,7 @@ a{{color:var(--cool);text-underline-offset:4px}}
       <button class="motion-toggle" type="button" aria-pressed="false">Pause animations</button>
     </nav>
   </div>
-  <div class="device">{('<video src="' + b64("video/mp4", clips["loader"]) + '" autoplay muted loop playsinline width="280" height="280"></video>') if clips.get("loader") else ('<img src="' + img["heating"] + '" alt="Heating" width="280" height="280">')}</div>
+  <div class="device">{('<video src="' + b64("video/mp4", clips["loader"]) + '" muted loop playsinline width="280" height="280"></video>') if clips.get("loader") else ('<img src="' + img["heating"] + '" alt="Heating" width="280" height="280">')}</div>
 </section>
 <section class="strip">
   <div><div class="eyebrow">Walkthrough</div><h2>Nine screens, in the order you meet them</h2></div>
@@ -375,7 +375,7 @@ updateMotion();
 </body>
 </html>
 '''
-    with open(PAGE, "w") as f:
+    with open(PAGE, "w", encoding="utf-8") as f:
         f.write(html)
     print("page", PAGE, len(html) // 1024, "KB")
     # Pages uses the same content with cacheable assets instead of data URLs.
@@ -386,7 +386,7 @@ updateMotion();
         if data:
             site = site.replace(b64("video/mp4", data), f"video/{name}.mp4")
     site_path = os.path.join(ROOT, "docs", "index.html")
-    with open(site_path, "w") as f:
+    with open(site_path, "w", encoding="utf-8") as f:
         f.write(site)
     print("site", site_path, len(site) // 1024, "KB")
 
