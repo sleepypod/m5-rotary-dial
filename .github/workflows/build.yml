@@ -53,4 +53,5 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: sleepypod/m5-rotary-dial
           files: coverage.xml
+          disable_search: true # only the gcovr report; skip the raw .gcov from libdeps
           fail_ci_if_error: false
