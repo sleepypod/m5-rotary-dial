@@ -1291,9 +1291,10 @@ void renderMainScreen(unsigned long now)
     solidAngle = fminf(curAngle, fillAngle);
     spanFrom = solidAngle;
     spanTo = fmaxf(curAngle, fillAngle);
-    // Shimmer: a soft highlight travels from the mattress temperature toward
-    // the target (both directions), eases in and out, then rests before
-    // restarting. Too short a span for a blob pulses instead.
+    // Shimmer: a soft highlight travels along the span in the arc's own
+    // direction (from the solid fill outward, whether heating or cooling),
+    // eases in and out, then rests before restarting. Too short a span for
+    // a blob pulses instead.
     const unsigned long travel = th.night ? 4000 : 2600, rest = 400;
     unsigned long t = now % (travel + rest);
     if (spanTo - spanFrom >= 24.0f)
@@ -1302,7 +1303,7 @@ void renderMainScreen(unsigned long now)
       {
         float p = (float)t / (float)travel;
         p = -(cosf(PI * p) - 1.0f) / 2.0f; // ease-in-out sine
-        float pos = curAngle + (fillAngle - curAngle) * p;
+        float pos = spanFrom + (spanTo - spanFrom) * p;
         glow10 = (int)((pos - ARC_START) * 10.0f);
       }
       else
@@ -1319,6 +1320,22 @@ void renderMainScreen(unsigned long now)
   }
   drawArcRing(solidAngle, spanFrom, spanTo, glow10, sigma10, pulse, !wifiConnected, th);
   uint16_t fillDim = th.muted;
+  if (converging)
+  {
+    // Round off the far end of the span in its own (dim, maybe highlighted) colour
+    float mix = glow10 >= 0 ? 0.40f : (0.35f + 0.65f * pulse);
+    int end10 = (int)((spanTo - ARC_START) * 10.0f);
+    if (glow10 >= 0 && sigma10 > 0)
+    {
+      int d = end10 - glow10;
+      if (d < 0) d = -d;
+      if (d < sigma10 * 3) mix += (1.0f - mix) * expf(-(float)(d * d) / (2.0f * (float)sigma10 * (float)sigma10));
+    }
+    uint16_t g = wifiConnected ? arcColor((spanTo - ARC_START) / ARC_SPAN, th) : fillDim;
+    int x, y;
+    polar(spanTo, ARC_R_MID, x, y);
+    sprite.fillSmoothCircle(x, y, ARC_CAP_R, lerp565(th.bg, g, mix));
+  }
   {
     int x, y;
     polar(ARC_START, ARC_R_MID, x, y);
@@ -2170,7 +2187,7 @@ void handleEncoderInPasswordEntry()
 
 // Single-character commands over USB serial so the UI can be exercised and
 // inspected without touching the device:
-//   + / -  one detent up / down     c  click (switch side)  o  toggle power
+//   + / -  one detent up / down     c  click (switch side)  o  toggle power   P  ensure on
 //   n      cycle night override     z  force dim now        w  wake
 //   p      dump the framebuffer (run-length encoded RGB565 hex)
 //   h / l  fake the mattress 9°F below / above the setpoint (heating / cooling)
@@ -2188,6 +2205,7 @@ void handleSerialDebug()
     case '-': simulatedEncoderDelta -= 1; break;
     case 'c': if (!inSettingsMenu) { recordActivity(); cycleSide(+1); } break;
     case 'o': if (!inSettingsMenu) { recordActivity(); setActivePower(!isActivePowerOn()); } break;
+    case 'P': if (!inSettingsMenu && !isActivePowerOn()) { recordActivity(); setActivePower(true); } break;
     case 'n':
       nightOverride = (NightOverride)(((int)nightOverride + 1) % 3);
       Serial.printf("night override -> %d\n", (int)nightOverride);

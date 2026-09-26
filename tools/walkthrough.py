@@ -180,7 +180,7 @@ def main():
         write_page(stills, clips)
         return
     d = Dial()
-    d.send("wxa")  # awake, main screen, mattress at target
+    d.send("wxPa", settle=1.5)  # awake, main screen, side on, mattress at target
     if ONLY:
         scripts = {
             "turn": [("", 5)] + [("+", 3)] * 6 + [("", 12)] + [("-", 3)] * 6 + [("", 15)],
