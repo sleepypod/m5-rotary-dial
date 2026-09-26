@@ -9,7 +9,7 @@
 #define TEMP_MAX_F 110     // Maximum temperature (°F) - sleepypod-core hardware limit
 #define TEMP_DEFAULT_F 75  // Default temperature setpoint (°F)
 
-// Sleepypod-core API Settings
+// sleepypod-core API Settings
 #define POD_API_PORT 3000  // sleepypod-core tRPC HTTP port
 #define HTTP_TIMEOUT_MS 1500 // Keep short: HTTP calls block the UI loop
 

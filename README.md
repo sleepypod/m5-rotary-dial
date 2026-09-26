@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/screens/banner.png" alt="Sleepypod Dial: heating, night theme, and the dimmed glance state" width="900">
+  <img src="docs/screens/banner.png" alt="sleepypod Dial: heating, night theme, and the dimmed glance state" width="900">
 </p>
 
-<h1 align="center">Sleepypod Dial</h1>
+<h1 align="center">sleepypod Dial</h1>
 
 <p align="center"><strong>One arc. One number. Nothing to learn in the dark.</strong></p>
 

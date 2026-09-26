@@ -1,4 +1,4 @@
-// Sleepypod MT Rotary Dial — M5Stack Dial temperature controller for sleepypod-core
+// sleepypod MT Rotary Dial — M5Stack Dial temperature controller for sleepypod-core
 //
 // Based on RotaryDial by dallonby (https://github.com/dallonby/RotaryDial)
 // Adapted to use sleepypod-core tRPC/REST APIs instead of FreeSleep
@@ -337,7 +337,7 @@ void setup()
   M5Dial.begin(cfg, true, false); // Enable encoder, disable RFID
 
   Serial.begin(115200);
-  Serial.println("\n\nSleepypod MT Rotary Dial");
+  Serial.println("\n\nsleepypod MT Rotary Dial");
   Serial.println("=======================");
   Serial.println("Based on RotaryDial by dallonby");
   Serial.println("https://github.com/dallonby/RotaryDial");

@@ -1,4 +1,4 @@
-# Sleepypod Dial: technical overview
+# sleepypod Dial: technical overview
 
 The README is the product page. This is the reference for how the firmware behaves and what it talks to. See also [architecture.md](architecture.md) for boot, loop, rendering and state diagrams.
 
