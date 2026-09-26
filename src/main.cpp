@@ -23,6 +23,7 @@
 #include <esp_task_wdt.h>
 #include <time.h>
 #include "config.h"
+#include "dial_logic.h"
 #include "sleepypod_api.h"
 
 Preferences preferences;
@@ -119,11 +120,10 @@ bool holdIsTouch = false;
 bool holdConsumed = false;
 
 // OFF stop below the minimum setpoint
-int offDetentAccum = 0;
+OffStop offStop;
 
 // Rotation acceleration: timestamps of the last three detents
-unsigned long detentTimes[3] = {0, 0, 0};
-uint8_t detentIdx = 0;
+DetentAccel detentAccel;
 
 // Pod connection
 IPAddress podIP(192, 168, 1, 88); // Default Pod IP
@@ -173,8 +173,7 @@ const int ARC_R_OUTER = 108;
 const int ARC_R_INNER = 96;
 const int ARC_R_MID = (ARC_R_OUTER + ARC_R_INNER) / 2;
 const int ARC_CAP_R = (ARC_R_OUTER - ARC_R_INNER) / 2;
-const float ARC_START = 135.0f;  // bottom-left
-const float ARC_SPAN = 270.0f;   // opening centred at the bottom
+// ARC_START / ARC_SPAN live in dial_logic.h
 const int GLYPH_Y = 206;         // power / settings glyphs flank the clock in the arc opening
 const int GLYPH_POWER_X = 66;
 const int GLYPH_GEAR_X = 174;
@@ -319,7 +318,6 @@ unsigned long uiMillis();
 void noteDetent(unsigned long now, int &stepSize);
 void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now);
 float tweenValue(Tween &t, unsigned long now);
-float setpointAngle(int tempF);
 void buildArcTable();
 void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th);
 void flushPendingApi();
@@ -723,17 +721,13 @@ bool consumeSafeWake()
 // a spin never overshoots by twenty degrees.
 void noteDetent(unsigned long now, int &stepSize)
 {
-  unsigned long oldest = detentTimes[detentIdx];
-  detentTimes[detentIdx] = now;
-  detentIdx = (detentIdx + 1) % 3;
-  stepSize = (oldest != 0 && now - oldest <= ACCEL_WINDOW_MS) ? 2 : 1;
+  stepSize = detentAccel.note(now);
   lastDetentTime = now;
 }
 
 void applySetpoint(int newTemp)
 {
-  if (newTemp < TEMP_MIN_F) newTemp = TEMP_MIN_F;
-  if (newTemp > TEMP_MAX_F) newTemp = TEMP_MAX_F;
+  newTemp = clampTemperatureF(newTemp);
 
   getActiveSetpoint() = newTemp;
   pendingTemp[activeSide == SIDE_RIGHT ? 1 : 0] = true;
@@ -772,7 +766,7 @@ void cycleSide(int direction)
 
   (void)direction; // two sides: any switch is a toggle
   activeSide = (activeSide == SIDE_LEFT) ? SIDE_RIGHT : SIDE_LEFT;
-  offDetentAccum = 0;
+  offStop.reset();
   Serial.printf("Side -> %s\n", activeSide == SIDE_RIGHT ? "right" : "left");
 
   tweenStart(arcTween, fromAngle, setpointAngle(getDisplaySetpoint()), SIDE_SWITCH_MS, now);
@@ -832,35 +826,23 @@ void handleEncoderInput()
       bool powerOn = isActivePowerOn();
       int current = getDisplaySetpoint();
 
-      if (!powerOn)
+      switch (offStop.detent(powerOn, current, dir))
       {
-        // OFF stop: any upward detent turns the side back on at its last setpoint
-        if (dir > 0)
-        {
-          offDetentAccum = 0;
-          setActivePower(true);
-        }
-        continue;
+      case OFFSTOP_TURN_ON: // OFF stop: any upward detent turns the side back on at its last setpoint
+        setActivePower(true);
+        break;
+      case OFFSTOP_TURN_OFF: // OFF_DETENTS past the minimum
+        setActivePower(false);
+        break;
+      case OFFSTOP_COUNTING:
+        drawTemperatureUI(); // show the "off" hint building
+        break;
+      case OFFSTOP_ADJUST:
+        applySetpoint(current + dir * step);
+        break;
+      case OFFSTOP_IGNORE:
+        break;
       }
-
-      if (dir < 0 && current <= TEMP_MIN_F)
-      {
-        // Past the minimum: count detents toward the OFF stop
-        offDetentAccum++;
-        if (offDetentAccum >= OFF_DETENTS)
-        {
-          offDetentAccum = 0;
-          setActivePower(false);
-        }
-        else
-        {
-          drawTemperatureUI(); // show the "off" hint building
-        }
-        continue;
-      }
-
-      offDetentAccum = 0;
-      applySetpoint(current + dir * step);
     }
   }
 }
@@ -1020,14 +1002,6 @@ float tweenValue(Tween &t, unsigned long now)
   return t.from + (t.to - t.from) * easeInOutCubic(p);
 }
 
-float setpointAngle(int tempF)
-{
-  float pct = (float)(tempF - TEMP_MIN_F) / (float)(TEMP_MAX_F - TEMP_MIN_F);
-  if (pct < 0) pct = 0;
-  if (pct > 1) pct = 1;
-  return ARC_START + pct * ARC_SPAN;
-}
-
 Theme currentTheme()
 {
   Theme th;
@@ -1057,49 +1031,11 @@ Theme currentTheme()
   return th;
 }
 
-static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
-{
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-
 // Arc gradient: five perceptual stops, cold-water blue through a body-neutral
-// warm white to red-orange. Night is a two-stop red ramp.
+// warm white to red-orange. Night is a two-stop red ramp. (dial_logic.cpp)
 uint16_t arcColor(float percent, const Theme &th)
 {
-  if (percent < 0.0f) percent = 0.0f;
-  if (percent > 1.0f) percent = 1.0f;
-
-  if (th.night)
-  {
-    uint8_t r = (uint8_t)(0x88 + (0xE0 - 0x88) * percent);
-    return rgb565(r, 0, 0);
-  }
-
-  static const float stops[5] = {0.0f, 10.0f / 55.0f, 25.0f / 55.0f, 40.0f / 55.0f, 1.0f};
-  static const uint8_t rgb[5][3] = {
-      {0x3B, 0x8B, 0xFF}, // 55°F
-      {0x35, 0xC4, 0xE0}, // 65°F
-      {0xE8, 0xE4, 0xDC}, // 80°F
-      {0xFF, 0xA5, 0x3C}, // 95°F
-      {0xFF, 0x5A, 0x3C}  // 110°F
-  };
-  int i = 0;
-  while (i < 3 && percent > stops[i + 1]) i++;
-  float t = (percent - stops[i]) / (stops[i + 1] - stops[i]);
-  uint8_t r = rgb[i][0] + (int)((rgb[i + 1][0] - rgb[i][0]) * t);
-  uint8_t g = rgb[i][1] + (int)((rgb[i + 1][1] - rgb[i][1]) * t);
-  uint8_t b = rgb[i][2] + (int)((rgb[i + 1][2] - rgb[i][2]) * t);
-  return rgb565(r, g, b);
-}
-
-static uint16_t lerp565(uint16_t a, uint16_t b, float t)
-{
-  int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
-  int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
-  int r = ar + (int)((br - ar) * t);
-  int g = ag + (int)((bg - ag) * t);
-  int bl = ab + (int)((bb - ab) * t);
-  return (r << 11) | (g << 5) | bl;
+  return arcColor(percent, th.night);
 }
 
 static void polar(float deg, int r, int &x, int &y)
@@ -1294,29 +1230,11 @@ void renderMainScreen(unsigned long now)
     // Shimmer: a soft highlight travels along the span in the arc's own
     // direction (from the solid fill outward, whether heating or cooling),
     // eases in and out, then rests before restarting. Too short a span for
-    // a blob pulses instead.
-    const unsigned long travel = th.night ? 4000 : 2600, rest = 400;
-    unsigned long t = now % (travel + rest);
-    if (spanTo - spanFrom >= 24.0f)
-    {
-      if (t < travel)
-      {
-        float p = (float)t / (float)travel;
-        p = -(cosf(PI * p) - 1.0f) / 2.0f; // ease-in-out sine
-        float pos = spanFrom + (spanTo - spanFrom) * p;
-        glow10 = (int)((pos - ARC_START) * 10.0f);
-      }
-      else
-      {
-        glow10 = 0x7FFF; // resting: base only, no highlight anywhere
-      }
-      sigma10 = th.night ? 80 : 60;
-    }
-    else
-    {
-      float ph = (float)(now % 2400) / 2400.0f;
-      pulse = 0.5f + 0.5f * sinf(ph * 2.0f * PI);
-    }
+    // a blob pulses instead. (shimmerAt in dial_logic.cpp)
+    ShimmerParams sh = shimmerAt(now, spanFrom, spanTo, th.night);
+    glow10 = sh.glow10;
+    sigma10 = sh.sigma10;
+    pulse = sh.pulse;
   }
   drawArcRing(solidAngle, spanFrom, spanTo, glow10, sigma10, pulse, !wifiConnected, th);
   uint16_t fillDim = th.muted;
@@ -1389,7 +1307,7 @@ void renderMainScreen(unsigned long now)
       formatTemp(currentF, val, sizeof(val));
       drawStatusLine("Off", val, y, th.muted);
     }
-    else if (offDetentAccum > 0)
+    else if (offStop.accum > 0)
     {
       drawStatusLine("turn once more for off", "", y, th.secondary);
     }
@@ -1688,7 +1606,7 @@ void handleEncoderInSettings()
       defaultRightSide = !defaultRightSide;
       preferences.putBool("rightSide", defaultRightSide);
       activeSide = defaultRightSide ? SIDE_RIGHT : SIDE_LEFT;
-      offDetentAccum = 0;
+      offStop.reset();
       drawSettingsMenu();
       break;
     default: break;
@@ -2552,16 +2470,14 @@ void syncStatusFromPod()
   {
     if (status.left.valid)
     {
-      if (status.left.targetTemperatureF >= TEMP_MIN_F && status.left.targetTemperatureF <= TEMP_MAX_F)
-        leftSetpoint = status.left.targetTemperatureF;
+      leftSetpoint = mergeSetpoint(leftSetpoint, status.left);
       leftCurrentTempF = status.left.currentTemperatureF;
       leftPowerOn = status.left.isPowered;
       Serial.printf("Left synced: target=%d°F actual=%d°F %s\n", leftSetpoint, leftCurrentTempF, leftPowerOn ? "ON" : "OFF");
     }
     if (status.right.valid)
     {
-      if (status.right.targetTemperatureF >= TEMP_MIN_F && status.right.targetTemperatureF <= TEMP_MAX_F)
-        rightSetpoint = status.right.targetTemperatureF;
+      rightSetpoint = mergeSetpoint(rightSetpoint, status.right);
       rightCurrentTempF = status.right.currentTemperatureF;
       rightPowerOn = status.right.isPowered;
       Serial.printf("Right synced: target=%d°F actual=%d°F %s\n", rightSetpoint, rightCurrentTempF, rightPowerOn ? "ON" : "OFF");
@@ -2573,12 +2489,12 @@ void syncStatusFromPod()
   if (settings.success)
   {
     // Update side names
-    if (settings.leftName.length() > 0)
+    if (settings.leftName[0] != '\0')
     {
       leftSideName = settings.leftName;
       preferences.putString("leftName", leftSideName);
     }
-    if (settings.rightName.length() > 0)
+    if (settings.rightName[0] != '\0')
     {
       rightSideName = settings.rightName;
       preferences.putString("rightName", rightSideName);
@@ -2586,7 +2502,7 @@ void syncStatusFromPod()
 
     // Sync temperature unit preference from Pod — unless the user has
     // explicitly chosen a unit on the dial
-    bool podUsesF = (settings.temperatureUnit == "F");
+    bool podUsesF = (strcmp(settings.temperatureUnit, "F") == 0);
     if (!unitOverridden && podUsesF != useFahrenheit)
     {
       useFahrenheit = podUsesF;
@@ -2596,10 +2512,7 @@ void syncStatusFromPod()
 
     // Sync auto-restart setting from Pod
     autoRestartEnabled = settings.rebootDaily;
-    if (settings.rebootTime.length() >= 4)
-    {
-      autoRestartHour = settings.rebootTime.substring(0, 2).toInt();
-    }
+    autoRestartHour = parseRebootHour(settings.rebootTime, autoRestartHour);
     Serial.printf("Auto-restart: %s at %02d:00\n",
                   autoRestartEnabled ? "enabled" : "disabled", autoRestartHour);
   }
@@ -2630,18 +2543,16 @@ void applyPodStatus(const PodStatus &status)
     if (status.left.valid)
     {
       if (leftPowerOn != status.left.isPowered) { leftPowerOn = status.left.isPowered; needsRedraw = true; }
-      // The Pod reports target 0 for a side that is off; keep the last real setpoint
-      if (leftSetpoint != status.left.targetTemperatureF &&
-          status.left.targetTemperatureF >= TEMP_MIN_F && status.left.targetTemperatureF <= TEMP_MAX_F)
-      { leftSetpoint = status.left.targetTemperatureF; needsRedraw = true; }
+      // The Pod reports target 0 for a side that is off; mergeSetpoint keeps the last real setpoint
+      int merged = mergeSetpoint(leftSetpoint, status.left);
+      if (leftSetpoint != merged) { leftSetpoint = merged; needsRedraw = true; }
       if (leftCurrentTempF != status.left.currentTemperatureF) { leftCurrentTempF = status.left.currentTemperatureF; needsRedraw = true; }
     }
     if (status.right.valid)
     {
       if (rightPowerOn != status.right.isPowered) { rightPowerOn = status.right.isPowered; needsRedraw = true; }
-      if (rightSetpoint != status.right.targetTemperatureF &&
-          status.right.targetTemperatureF >= TEMP_MIN_F && status.right.targetTemperatureF <= TEMP_MAX_F)
-      { rightSetpoint = status.right.targetTemperatureF; needsRedraw = true; }
+      int merged = mergeSetpoint(rightSetpoint, status.right);
+      if (rightSetpoint != merged) { rightSetpoint = merged; needsRedraw = true; }
       if (rightCurrentTempF != status.right.currentTemperatureF) { rightCurrentTempF = status.right.currentTemperatureF; needsRedraw = true; }
     }
   }

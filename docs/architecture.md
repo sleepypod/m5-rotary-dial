@@ -153,6 +153,8 @@ The encoder is polled by a 1ms FreeRTOS task (its GPIOs have no interrupt slot),
 
 All rendering goes through one full-screen LGFX_Sprite. The loop only renders a frame when state changed, a tween is active (arc settle 180ms, side switch 220ms, hold ring), the highlight is travelling (10fps), or the minute changed. Backlight changes fade in perceptual (sqrt) space. The dim state is a separate, minimal render: numeral plus one status dot.
 
+The logic that does not need the hardware lives in `src/dial_logic.h` / `.cpp`: temperature clamp and °F/°C conversion, setpoint-to-arc-angle mapping (`ARC_START` 135°, `ARC_SPAN` 270°), the day and night gradients (`arcColor`, `rgb565`, `lerp565`), detent acceleration (`DetentAccel`), the OFF stop (`OffStop`), the loader shimmer (`shimmerAt`), and the Pod JSON parsers (`parsePodStatus`, `parsePodSettings`, `mergeSetpoint`). It is plain C++17 with no Arduino dependency; `main.cpp` and `sleepypod_api.cpp` call into it, and `test/test_logic` runs it on the host (`pio test -e native`) with gcov coverage. This is the tested core; everything above it is rendering, input and networking glue.
+
 Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encoder path, `c` click, `o` power, `n` night override, `z` dim, `w` wake, `p` dump the framebuffer as hex. `tools/dial_shot.py <out.png> [cmds...]` drives this and writes a PNG. `T`/`t` freeze/unfreeze the UI clock; frozen, each `p` advances one 25fps frame; `tools/walkthrough.py` uses that to record the animation clips.
 
 ## State Management
