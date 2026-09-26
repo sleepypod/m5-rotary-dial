@@ -61,6 +61,18 @@ The dial exposes its own API on port 80 for home automation:
 | `/api/status` | GET | Full device status |
 | `/api/config/pod-ip` | GET/POST | Pod IP configuration |
 
+## Screens
+
+Captured from the device with `tools/dial_shot.py`.
+
+| Heating | Cooling | At target | Off |
+|---|---|---|---|
+| ![](docs/screens/heating.png) | ![](docs/screens/cooling.png) | ![](docs/screens/at-target.png) | ![](docs/screens/off.png) |
+
+| Hold for settings | Settings | Night | Dim (night / day) |
+|---|---|---|---|
+| ![](docs/screens/hold-ring.png) | ![](docs/screens/settings.png) | ![](docs/screens/night.png) | ![](docs/screens/night-dim.png) ![](docs/screens/day-dim.png) |
+
 ## Hardware Requirements
 
 - **[M5Stack Dial](https://shop.m5stack.com/products/m5stack-dial-esp32-s3-smart-rotary-knob-w-1-28-round-touch-screen)** — ESP32-S3, 240x240 round capacitive touchscreen, rotary encoder
