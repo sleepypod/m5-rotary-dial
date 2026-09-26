@@ -1,5 +1,5 @@
 # Capture the walkthrough from a connected Dial: stills for every state, short
-# video clips of the animations, and a self-contained HTML page.
+# video clips of the animations, a self-contained HTML page, and a Pages site.
 #
 #   ~/.platformio/penv/bin/python tools/walkthrough.py            # everything
 #   ~/.platformio/penv/bin/python tools/walkthrough.py --no-video # stills + page only
@@ -9,7 +9,7 @@
 # Needs pyserial (PlatformIO's Python has it) and ffmpeg on PATH for video.
 # Uses the firmware's serial debug channel (see handleSerialDebug in main.cpp).
 # Fake mattress temperatures (h/l/a) are local only; the Pod is never written.
-# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/walkthrough.html
+# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/walkthrough.html + docs/index.html
 import base64, os, shutil, struct, subprocess, sys, tempfile, time, zlib
 import serial
 
@@ -260,7 +260,12 @@ def write_page(stills, clips):
         video("settings", "Holding", "The ring fills over a second and a half, then settings opens. Let go early and nothing happens."),
     ])
 
-    html = f'''<title>sleepypod Dial</title>
+    html = f'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sleepypod Dial</title>
 <meta name="description" content="A bedside knob for the Eight Sleep Pod: one arc, one number, no menus in the dark.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600&family=Instrument+Sans:ital,wght@0,400;0,500;1,400&family=DM+Mono:wght@400;500&display=swap">
@@ -297,14 +302,27 @@ td:first-child{{font-weight:500;white-space:nowrap}}
 .nums b{{display:block;font-family:var(--mono);font-weight:500;font-size:26px;font-variant-numeric:tabular-nums}} .nums span{{font-size:13px;color:var(--muted)}}
 .warm{{color:var(--warm)}} .cool{{color:var(--cool)}}
 footer{{font-size:13px;color:var(--muted)}}
+a{{color:var(--cool);text-underline-offset:4px}}
+.links{{display:flex;flex-wrap:wrap;gap:12px 24px;margin-top:24px;align-items:center}}
+.links a{{font-weight:500}}
+.motion-toggle{{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 14px;cursor:pointer}}
+:focus-visible{{outline:3px solid var(--cool);outline-offset:5px}}
+@media (prefers-reduced-motion:reduce){{.rail{{scroll-behavior:auto;scroll-snap-type:none}}}}
 @media (max-width:760px){{.hero{{grid-template-columns:1fr}} .hero .device{{width:300px;height:300px}} .hero .device img,.hero .device video{{inset:30px;width:240px;height:240px}} .hero .device::before{{inset:14px}}}}
 </style>
+</head>
+<body>
 <main class="wrap">
 <section class="hero">
   <div>
     <div class="eyebrow">sleepypod Dial · for the Eight Sleep Pod</div>
     <h1>One arc. One number. Nothing to learn in the dark.</h1>
     <p class="lede">A bedside knob that shows where your mattress is, where it is going, and lets you turn it, click it off, and leave it alone. Every frame on this page was captured from the device.</p>
+    <nav class="links" aria-label="Project links">
+      <a href="https://github.com/sleepypod/m5-rotary-dial#setup">Build your dial →</a>
+      <a href="https://github.com/sleepypod/m5-rotary-dial">Source on GitHub</a>
+      <button class="motion-toggle" type="button" aria-pressed="false">Pause animations</button>
+    </nav>
   </div>
   <div class="device">{('<video src="' + b64("video/mp4", clips["loader"]) + '" autoplay muted loop playsinline width="280" height="280"></video>') if clips.get("loader") else ('<img src="' + img["heating"] + '" alt="Heating" width="280" height="280">')}</div>
 </section>
@@ -339,10 +357,38 @@ footer{{font-size:13px;color:var(--muted)}}
 </section>
 <footer>Frames captured from an M5Stack Dial running the sleepypod-mt-rotary-dial firmware via tools/walkthrough.py. Names shown are example side names from the Pod's settings.</footer>
 </main>
+<script>
+const videos = [...document.querySelectorAll('video')];
+const button = document.querySelector('.motion-toggle');
+let paused = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function updateMotion() {{
+  videos.forEach(video => {{
+    if (paused) video.pause();
+    else video.play().catch(() => {{}});
+  }});
+  button.textContent = paused ? 'Play animations' : 'Pause animations';
+  button.setAttribute('aria-pressed', String(paused));
+}}
+button.addEventListener('click', () => {{ paused = !paused; updateMotion(); }});
+updateMotion();
+</script>
+</body>
+</html>
 '''
     with open(PAGE, "w") as f:
         f.write(html)
     print("page", PAGE, len(html) // 1024, "KB")
+    # Pages uses the same content with cacheable assets instead of data URLs.
+    site = html
+    for name, data in stills.items():
+        site = site.replace(b64("image/png", data), f"screens/{name}.png")
+    for name, data in clips.items():
+        if data:
+            site = site.replace(b64("video/mp4", data), f"video/{name}.mp4")
+    site_path = os.path.join(ROOT, "docs", "index.html")
+    with open(site_path, "w") as f:
+        f.write(site)
+    print("site", site_path, len(site) // 1024, "KB")
 
 
 if __name__ == "__main__":
