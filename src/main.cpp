@@ -3,7 +3,7 @@
 // Based on RotaryDial by dallonby (https://github.com/dallonby/RotaryDial)
 // Adapted to use sleepypod-core tRPC/REST APIs instead of FreeSleep
 //
-// Controls left/right sides of an Eight Sleep Pod via sleepypod-core,
+// Controls left/right sides of the Pod via sleepypod-core,
 // with mDNS auto-discovery, rotary dial interface, and automatic night mode.
 //
 // Interaction model (main screen):

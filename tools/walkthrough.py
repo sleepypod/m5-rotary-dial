@@ -261,7 +261,7 @@ def write_page(stills, clips):
     ])
 
     html = f'''<title>sleepypod Dial</title>
-<meta name="description" content="A bedside knob for the Eight Sleep Pod: one arc, one number, no menus in the dark.">
+<meta name="description" content="A bedside knob for your Pod: one arc, one number, no menus in the dark.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600&family=Instrument+Sans:ital,wght@0,400;0,500;1,400&family=DM+Mono:wght@400;500&display=swap">
 <style>
@@ -296,15 +296,23 @@ td:first-child{{font-weight:500;white-space:nowrap}}
 .nums{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:18px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding-block:22px}}
 .nums b{{display:block;font-family:var(--mono);font-weight:500;font-size:26px;font-variant-numeric:tabular-nums}} .nums span{{font-size:13px;color:var(--muted)}}
 .warm{{color:var(--warm)}} .cool{{color:var(--cool)}}
+.repos{{display:flex;flex-wrap:wrap;gap:12px;margin-top:22px}}
+.repo{{display:inline-flex;align-items:center;gap:9px;padding:9px 14px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none;font-size:15px;background:var(--panel)}}
+.repo:hover,.repo:focus-visible{{border-color:var(--muted);outline:none}} .repo .gh{{flex:none}} .repo small{{color:var(--muted);font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase}}
+footer .repos{{margin-top:12px}}
 footer{{font-size:13px;color:var(--muted)}}
 @media (max-width:760px){{.hero{{grid-template-columns:1fr}} .hero .device{{width:300px;height:300px}} .hero .device img,.hero .device video{{inset:30px;width:240px;height:240px}} .hero .device::before{{inset:14px}}}}
 </style>
 <main class="wrap">
 <section class="hero">
   <div>
-    <div class="eyebrow">sleepypod Dial · for the Eight Sleep Pod</div>
+    <div class="eyebrow">sleepypod Dial · a bedside knob for your Pod</div>
     <h1>One arc. One number. Nothing to learn in the dark.</h1>
     <p class="lede">A bedside knob that shows where your mattress is, where it is going, and lets you turn it, click it off, and leave it alone. Every frame on this page was captured from the device.</p>
+    <div class="repos">
+      <a class="repo" href="https://github.com/sleepypod/core"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/core <small>required</small></a>
+      <a class="repo" href="https://github.com/sleepypod/m5-rotary-dial"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/m5-rotary-dial <small>this dial</small></a>
+    </div>
   </div>
   <div class="device">{('<video src="' + b64("video/mp4", clips["loader"]) + '" autoplay muted loop playsinline width="280" height="280"></video>') if clips.get("loader") else ('<img src="' + img["heating"] + '" alt="Heating" width="280" height="280">')}</div>
 </section>
@@ -337,7 +345,12 @@ footer{{font-size:13px;color:var(--muted)}}
   <div><h3>Your name on it</h3><p>The side name comes from the Pod's settings, so the dial says Jon, not L.</p></div>
   <div><h3>Your changes win</h3><p>The Pod's own state never overwrites a number you touched in the last 30 seconds.</p></div>
 </section>
-<footer>Frames captured from an M5Stack Dial running the sleepypod-mt-rotary-dial firmware via tools/walkthrough.py. Names shown are example side names from the Pod's settings.</footer>
+<footer>Frames captured from an M5Stack Dial running the sleepypod-mt-rotary-dial firmware via tools/walkthrough.py. Names shown are example side names from the Pod's settings.
+  <div class="repos">
+    <a class="repo" href="https://github.com/sleepypod/core"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/core <small>required</small></a>
+    <a class="repo" href="https://github.com/sleepypod/m5-rotary-dial"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/m5-rotary-dial</a>
+  </div>
+</footer>
 </main>
 '''
     with open(PAGE, "w") as f:
