@@ -65,7 +65,7 @@ The intent is for the dial to expose its own API on port 80 for home automation.
 
 Captured from the device with `tools/walkthrough.py`, which also records
 short clips of the animations into `video/` and builds
-`walkthrough.html`, a self-contained walkthrough page.
+`index.html`, a self-contained walkthrough page.
 
 ![Turning](video/turn.gif) ![Getting there](video/loader.gif) ![Off and on](video/power.gif) ![Holding](video/settings.gif)
 

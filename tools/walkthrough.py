@@ -9,7 +9,7 @@
 # Needs pyserial (PlatformIO's Python has it) and ffmpeg on PATH for video.
 # Uses the firmware's serial debug channel (see handleSerialDebug in main.cpp).
 # Fake mattress temperatures (h/l/a) are local only; the Pod is never written.
-# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/walkthrough.html
+# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/index.html
 import base64, os, shutil, struct, subprocess, sys, tempfile, time, zlib
 import serial
 
@@ -17,7 +17,7 @@ PORT = os.environ.get("DIAL_PORT", "/dev/cu.usbmodem21201")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCREENS = os.path.join(ROOT, "docs", "screens")
 VIDEO = os.path.join(ROOT, "docs", "video")
-PAGE = os.path.join(ROOT, "docs", "walkthrough.html")
+PAGE = os.path.join(ROOT, "docs", "index.html")
 W = H = 240
 NO_VIDEO = "--no-video" in sys.argv
 ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None  # capture one clip, no page
