@@ -1,16 +1,26 @@
-// Sleepypod MT Rotary Dial — M5Stack Dial temperature controller for sleepypod-core
+// sleepypod MT Rotary Dial — M5Stack Dial temperature controller for sleepypod-core
 //
 // Based on RotaryDial by dallonby (https://github.com/dallonby/RotaryDial)
 // Adapted to use sleepypod-core tRPC/REST APIs instead of FreeSleep
 //
 // Controls left/right sides of an Eight Sleep Pod via sleepypod-core,
 // with mDNS auto-discovery, rotary dial interface, and automatic night mode.
+//
+// Interaction model (main screen):
+//   rotate            adjust the active side's setpoint (1°F/detent, 2°F when spun)
+//   rotate below min  two extra detents reach the OFF stop; rotating up turns back on
+//   click the dial    toggle the side's power (also: tap the power glyph)
+//   hold the dial     1s with a progress ring opens settings (also: tap the gear)
+// The side is a preference (Settings > Side); the arc shows the mattress
+// temperature as solid fill and the span still to travel to the target as a
+// hashed, slowly marching "loader" segment.
 
 #include <M5Dial.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 #include <time.h>
 #include "config.h"
 #include "sleepypod_api.h"
@@ -26,11 +36,18 @@ bool wifiConnected = false;
 bool podFound = false;
 long lastEncoderPosition = 0;
 unsigned long lastActivityTime = 0;
-unsigned long lastClockUpdate = 0;
 bool isDimmed = false;
+unsigned long dimmedAt = 0;
 bool timeInitialized = false;
-bool rightSideActive = false;   // false = left side (default), true = right side
 bool inSettingsMenu = false;
+
+// Which side the dial is steering
+enum Side : uint8_t
+{
+  SIDE_LEFT = 0,
+  SIDE_RIGHT
+};
+Side activeSide = SIDE_LEFT;
 
 // Night mode override: Auto follows the schedule; On/Off force it
 enum NightOverride
@@ -79,9 +96,13 @@ int autoRestartHour = 3; // Default 3am
 bool restartTriggeredToday = false;
 int lastRestartCheckDay = -1;
 
-// Debounce for sleepypod-core API updates
+// Debounced sleepypod-core writes. Local state changes immediately (the arc
+// cap is drawn hollow until the Pod confirms); the flush sends whatever is
+// pending per side once input has been quiet for API_DEBOUNCE_MS.
 unsigned long lastSetpointChangeTime = 0;
 bool pendingApiUpdate = false;
+bool pendingTemp[2] = {false, false};
+bool pendingPower[2] = {false, false};
 const unsigned long API_DEBOUNCE_MS = 500;
 
 // Periodic sync from sleepypod-core
@@ -91,18 +112,18 @@ const unsigned long POD_SYNC_INTERVAL_MS = 30000; // 30 seconds
 // Track night mode state to detect changes
 bool wasNightMode = false;
 
-// Touch duration tracking for center tap
-unsigned long centerTouchStartTime = 0;
-unsigned long lastCenterTapTime = 0;
-bool centerTouchActive = false;
-bool waitingForDoubleClick = false;
-const unsigned long CLICK_MAX_MS = 400;
-const unsigned long NIGHT_MODE_MAX_MS = 1000;
-const unsigned long DOUBLE_CLICK_WINDOW_MS = 500;
+// Press-and-hold (encoder button or touch) -> settings, with a progress ring
+unsigned long holdStartTime = 0;
+bool holdActive = false;
+bool holdIsTouch = false;
+bool holdConsumed = false;
 
-// Encoder button double-click tracking
-unsigned long lastEncoderButtonTime = 0;
-bool waitingForEncoderDoubleClick = false;
+// OFF stop below the minimum setpoint
+int offDetentAccum = 0;
+
+// Rotation acceleration: timestamps of the last three detents
+unsigned long detentTimes[3] = {0, 0, 0};
+uint8_t detentIdx = 0;
 
 // Pod connection
 IPAddress podIP(192, 168, 1, 88); // Default Pod IP
@@ -145,14 +166,111 @@ bool pwLongPressFired = false;
 const char alphaNumeric[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!@#$%^&*()_+-=[]{}|;:',.<>?/ ";
 // Carousel has one extra virtual entry at the end: DEL (backspace)
 
-// Display dimensions
+// Display geometry. LovyanGFX angles: 0° = 3 o'clock, clockwise.
 const int centerX = SCREEN_WIDTH / 2;
 const int centerY = SCREEN_HEIGHT / 2;
-const int arcRadius = 100;
-const int arcThickness = 20;
+const int ARC_R_OUTER = 108;
+const int ARC_R_INNER = 96;
+const int ARC_R_MID = (ARC_R_OUTER + ARC_R_INNER) / 2;
+const int ARC_CAP_R = (ARC_R_OUTER - ARC_R_INNER) / 2;
+const float ARC_START = 135.0f;  // bottom-left
+const float ARC_SPAN = 270.0f;   // opening centred at the bottom
+const int GLYPH_Y = 206;         // power / settings glyphs flank the clock in the arc opening
+const int GLYPH_POWER_X = 66;
+const int GLYPH_GEAR_X = 174;
+const int GLYPH_HIT_R = 26;
 
-// Sprite for double buffering
+// Ring table: every pixel of the 270° arc annulus, precomputed once at boot
+// (sprite offset, angle from ARC_START in 0.1°, 4-bit edge coverage). Filling
+// the arc is then one pass over ~6K pixels instead of 90 sector scans.
+struct ArcPx
+{
+  uint16_t offset;
+  uint16_t packed; // coverage(4 bits) << 12 | angle10 (0..2700)
+};
+ArcPx *arcTable = nullptr;
+int arcTableLen = 0;
+uint16_t gradientLut[256];
+int gradientLutNight = -1;
+
+// Rendering: one back buffer, redrawn only when something moves
 LGFX_Sprite sprite(&M5Dial.Display);
+bool uiDirty = true;
+unsigned long lastFrameTime = 0;
+int lastDrawnMinute = -1;
+uint32_t frameUsLast = 0, frameUsMax = 0, frameCount = 0;
+uint32_t sectUs[4] = {0, 0, 0, 0}; // arc, marker+sides, text, push
+
+// Time-based tweens (millis driven, never block)
+struct Tween
+{
+  float from = 0, to = 0;
+  unsigned long t0 = 0, dur = 1;
+  bool active = false;
+};
+Tween arcTween;       // arc fill angle
+unsigned long lastDetentTime = 0;
+
+// The encoder on GPIO 40/41 has no interrupt slot, so the library only
+// advances its state inside read(). A 1ms task keeps it polled while the UI
+// loop is busy rendering; the loop reads the shared value.
+volatile int32_t encoderShared = 0;
+void encoderTask(void *)
+{
+  for (;;)
+  {
+    encoderShared = M5Dial.Encoder.read();
+    vTaskDelay(1);
+  }
+}
+long readEncoder() { return (long)encoderShared; }
+
+// Pod HTTP runs on a worker task (core 0, next to WiFi) so a slow Pod never
+// stalls the UI loop. The loop hands it one job at a time and consumes the
+// result on a later pass.
+enum HttpJobKind : uint8_t { HTTP_JOB_FLUSH = 1, HTTP_JOB_SYNC = 2 };
+struct FlushJob
+{
+  bool temp[2];
+  bool power[2];
+  int setpoint[2];
+  bool powerOn[2];
+};
+QueueHandle_t httpQueue = nullptr;
+// The USB serial driver is not safe for two cores writing at once: the HTTP
+// worker logs while the loop may be streaming a framebuffer dump. Both take
+// this mutex around their output-heavy sections.
+SemaphoreHandle_t serialMutex = nullptr;
+volatile bool httpBusy = false;
+FlushJob httpFlushJob;
+volatile bool httpFlushDone = false;
+bool httpFlushOk = false;
+PodStatus httpSyncResult;
+volatile bool httpSyncDone = false;
+void httpTask(void *);
+
+// Serial debug channel (see handleSerialDebug): simulated detents feed the
+// real encoder path so the OFF stop and acceleration are exercised too
+long simulatedEncoderDelta = 0;
+// Demo clock: when frozen, every 'p' advances it by one 25fps frame before
+// rendering, so animations can be captured frame by frame over serial
+bool demoFrozen = false;
+unsigned long demoNow = 0;
+bool dumpAfterFrame = false;
+unsigned long debugHoldStart = 0; // simulated hold start on the UI clock (0 = none)
+unsigned long uiMillis() { return demoFrozen ? demoNow : millis(); }
+
+// Backlight fade
+float brightnessNow = BRIGHTNESS_DAY;
+float brightnessTarget = BRIGHTNESS_DAY;
+Tween brightnessTween;
+
+// Theme for the current mode
+struct Theme
+{
+  bool night;
+  uint16_t bg, track, muted, secondary, text, alert, cool, warm;
+};
 
 // ==================== Function Prototypes ====================
 
@@ -160,25 +278,28 @@ void setupWiFi();
 void setupMDNS();
 void setupNTP();
 void drawTemperatureUI();
+void renderMainScreen(unsigned long now);
+void renderDimScreen();
 void drawSettingsMenu();
 void drawIPEditor();
 void drawWiFiScanner();
 void drawPasswordEntry();
-void updateClockDisplay();
 void handleEncoderInput();
 void handleEncoderInSettings();
 void handleEncoderInIPEditor();
 void handleEncoderInWiFiScanner();
 void handleEncoderInPasswordEntry();
 void handleTouchInput();
+void handleHold(unsigned long now);
 void updateBrightness();
 void recordActivity();
 bool isNightTime();
-uint16_t getTemperatureColor(float percent);
-uint16_t getTemperatureColorNight(float percent);
+Theme currentTheme();
+uint16_t arcColor(float percent, const Theme &th);
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max);
 int &getActiveSetpoint();
-int &getInactiveSetpoint();
+int getDisplaySetpoint();
+bool isActivePowerOn();
 String getMenuItemName(MenuItem item);
 void feedbackBeep(uint16_t freq);
 void drawBusyScreen(const char *msg);
@@ -189,8 +310,24 @@ void startWiFiScanner();
 void startPasswordEntry();
 void syncFromPod();
 void syncStatusFromPod();
-void toggleActivePower();
+void applySetpoint(int newTemp);
+void setActivePower(bool on);
+void cycleSide(int direction);
+void openSettings();
+bool consumeSafeWake();
+unsigned long uiMillis();
+void noteDetent(unsigned long now, int &stepSize);
+void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now);
+float tweenValue(Tween &t, unsigned long now);
+float setpointAngle(int tempF);
+void buildArcTable();
+void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th);
+void flushPendingApi();
+void consumeHttpResults();
+void applyPodStatus(const PodStatus &status);
 bool notePodRequestResult(bool ok);
+void handleSerialDebug();
+void dumpScreen();
 
 // ==================== Setup ====================
 
@@ -200,7 +337,7 @@ void setup()
   M5Dial.begin(cfg, true, false); // Enable encoder, disable RFID
 
   Serial.begin(115200);
-  Serial.println("\n\nSleepypod MT Rotary Dial");
+  Serial.println("\n\nsleepypod MT Rotary Dial");
   Serial.println("=======================");
   Serial.println("Based on RotaryDial by dallonby");
   Serial.println("https://github.com/dallonby/RotaryDial");
@@ -242,7 +379,7 @@ void setup()
 
   // Load default side
   defaultRightSide = preferences.getBool("rightSide", false);
-  rightSideActive = defaultRightSide;
+  activeSide = defaultRightSide ? SIDE_RIGHT : SIDE_LEFT;
   Serial.printf("Default side: %s\n", defaultRightSide ? "Right" : "Left");
 
   // Load cached side names (updated from Pod settings on sync)
@@ -252,16 +389,33 @@ void setup()
 
   // Initialize display
   M5Dial.Display.setRotation(0);
-  M5Dial.Display.fillScreen(COLOR_BACKGROUND);
-  M5Dial.Display.setTextColor(COLOR_TEXT);
+  M5Dial.Display.fillScreen(UI_BG);
+  M5Dial.Display.setTextColor(UI_SECONDARY);
   M5Dial.Display.setTextDatum(middle_center);
 
-  // Create sprite for double buffering
+  // Create sprite for double buffering (internal RAM so pushSprite can DMA)
   sprite.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
+  buildArcTable();
+
+  // Piezo: quiet, short ticks only
+  M5Dial.Speaker.setVolume(40);
+
+  // Touch: a flick must travel a bit before it counts as a swipe
+  M5Dial.Touch.setFlickThresh(16);
+
+  // If the UI loop ever stalls for 10s, panic (backtrace on serial) and reboot
+  esp_task_wdt_init(10, true);
+  esp_task_wdt_add(NULL);
+
+  // Background tasks: encoder polling (core 1, above the loop) and Pod HTTP (core 0)
+  xTaskCreatePinnedToCore(encoderTask, "encoder", 2048, nullptr, 3, nullptr, 1);
+  httpQueue = xQueueCreate(2, sizeof(uint8_t));
+  serialMutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(httpTask, "podhttp", 12288, nullptr, 1, nullptr, 0);
 
   // Show startup message
-  M5Dial.Display.setTextSize(1);
-  M5Dial.Display.drawString("Connecting...", centerX, centerY);
+  M5Dial.Display.setFont(&fonts::FreeSans9pt7b);
+  M5Dial.Display.drawString("Connecting", centerX, centerY);
 
   // Connect to WiFi
   setupWiFi();
@@ -280,11 +434,15 @@ void setup()
   }
 
   // Get initial encoder position
-  lastEncoderPosition = M5Dial.Encoder.read();
-  lastActivityTime = millis();
-  recordActivity();
+  lastEncoderPosition = readEncoder();
+  lastActivityTime = uiMillis();
   wasNightMode = isNightTime();
+  brightnessNow = wasNightMode ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY;
+  brightnessTarget = brightnessNow;
+  brightnessTween.to = sqrtf(brightnessNow);
+  M5Dial.Display.setBrightness((uint8_t)brightnessNow);
 
+  arcTween.to = setpointAngle(getDisplaySetpoint());
   drawTemperatureUI();
 }
 
@@ -292,39 +450,23 @@ void setup()
 
 void loop()
 {
+  esp_task_wdt_reset();
   M5Dial.update();
-  unsigned long currentMillis = millis();
+  unsigned long currentMillis = uiMillis();
 
+  handleSerialDebug();
+
+  // Encoder is polled (GPIO 40/41 have no interrupt slots), so read every pass
   handleEncoderInput();
   handleTouchInput();
-
-  // Check for single-click action after double-click window expires
-  if (waitingForDoubleClick && (currentMillis - lastCenterTapTime >= DOUBLE_CLICK_WINDOW_MS))
+  handleHold(currentMillis);
+  if (debugHoldStart && currentMillis - debugHoldStart >= SETTINGS_HOLD_MS)
   {
-    waitingForDoubleClick = false;
-    Serial.println("Single-click confirmed - toggling power");
-    toggleActivePower();
-  }
-
-  // Check for single encoder button click after double-click window
-  if (waitingForEncoderDoubleClick && (currentMillis - lastEncoderButtonTime >= DOUBLE_CLICK_WINDOW_MS))
-  {
-    waitingForEncoderDoubleClick = false;
-    if (!inSettingsMenu)
-    {
-      Serial.println("Encoder single-click - toggling power");
-      toggleActivePower();
-    }
+    debugHoldStart = 0;
+    if (!inSettingsMenu) openSettings();
   }
 
   updateBrightness();
-
-  // Update clock every second (main screen only)
-  if (!inSettingsMenu && currentMillis - lastClockUpdate >= 1000)
-  {
-    lastClockUpdate = currentMillis;
-    updateClockDisplay();
-  }
 
   // WiFi health check + auto-reconnect
   if (currentMillis - lastWifiCheck >= 10000)
@@ -343,7 +485,7 @@ void loop()
         syncStatusFromPod();
         networkServicesStarted = true;
       }
-      if (!inSettingsMenu) drawTemperatureUI();
+      drawTemperatureUI();
     }
     if (!nowConnected)
     {
@@ -351,24 +493,19 @@ void loop()
     }
   }
 
-  // Handle debounced API updates
-  if (pendingApiUpdate && (currentMillis - lastSetpointChangeTime >= API_DEBOUNCE_MS))
+  consumeHttpResults();
+
+  // Handle debounced API updates (one job in flight at a time)
+  if (pendingApiUpdate && !httpBusy && (currentMillis - lastSetpointChangeTime >= API_DEBOUNCE_MS))
   {
-    pendingApiUpdate = false;
-    const char *side = rightSideActive ? "right" : "left";
-    bool ok = setPodTemperature(podIP, side, getActiveSetpoint(), podPort);
-    bool reachable = notePodRequestResult(ok);
-    if (reachable != podReachable)
-    {
-      podReachable = reachable;
-      if (!inSettingsMenu) drawTemperatureUI();
-    }
+    flushPendingApi();
   }
 
-  // Periodic sync from Pod (back off after repeated failures so a dead
-  // Pod doesn't freeze the UI every 30 seconds)
+  // Periodic sync from Pod (back off after repeated failures). Remote state
+  // never overwrites a setpoint the user touched in the last 30s.
   unsigned long syncInterval = POD_SYNC_INTERVAL_MS * (podSyncFailures >= 3 ? 4 : 1);
-  if (wifiConnected && !inSettingsMenu && !pendingApiUpdate &&
+  if (wifiConnected && !inSettingsMenu && !pendingApiUpdate && !httpBusy &&
+      (currentMillis - lastActivityTime >= REMOTE_SYNC_HOLDOFF_MS) &&
       (currentMillis - lastPodSync >= syncInterval))
   {
     lastPodSync = currentMillis;
@@ -412,8 +549,62 @@ void loop()
     }
   }
 
-  delay(2);
+  // ---- Frame scheduling (main screen only) ----
+  if (!inSettingsMenu)
+  {
+    if (isDimmed)
+    {
+      if (uiDirty)
+      {
+        uiDirty = false;
+        renderDimScreen();
+      }
+    }
+    else
+    {
+      bool turning = (currentMillis - lastDetentTime) < 1000;
+      bool animating = arcTween.active || holdActive;
+      // The hashed span marches only when the dial is at rest: rendering is
+      // the loop's biggest cost and rotation needs the loop free
+      bool breathing = !turning && isActivePowerOn() && podReachable && wifiConnected;
+      if (breathing)
+      {
+        int diff = getDisplaySetpoint() - (activeSide == SIDE_RIGHT ? rightCurrentTempF : leftCurrentTempF);
+        breathing = abs(diff) > 1;
+      }
+      bool minuteChanged = false;
+      if (timeInitialized && currentMillis - lastFrameTime >= 1000)
+      {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo) && timeinfo.tm_min != lastDrawnMinute) minuteChanged = true;
+      }
+      unsigned long frameInterval = turning ? 40 : (animating ? 16 : (breathing ? 100 : 1000));
+      // Frozen demo clock: render exactly one frame per 'p', nothing else
+      bool wantFrame = demoFrozen ? dumpAfterFrame
+                                  : ((uiDirty || animating || breathing || minuteChanged) &&
+                                     currentMillis - lastFrameTime >= frameInterval);
+      if (wantFrame)
+      {
+        uiDirty = false;
+        lastFrameTime = currentMillis;
+        uint32_t t0 = micros();
+        renderMainScreen(currentMillis);
+        frameUsLast = micros() - t0;
+        if (frameUsLast > frameUsMax) frameUsMax = frameUsLast;
+        frameCount++;
+      }
+    }
+  }
+
+  if (dumpAfterFrame)
+  {
+    dumpAfterFrame = false;
+    dumpScreen();
+  }
+
+  delay(1);
 }
+
 
 // ==================== WiFi & Network ====================
 
@@ -513,9 +704,91 @@ void setupMDNS()
   }
 }
 
-// ==================== Web Server (Local API) ====================
+// ==================== Input: main screen ====================
 
-// ==================== Encoder Input ====================
+// While dimmed, input arriving more than SAFE_WAKE_ARM_MS after the dim
+// only wakes the screen (a bump in the dark must never change anything).
+// Input shortly after dimming acts normally: the user is clearly still there.
+// Returns true when the input was consumed by the wake.
+bool consumeSafeWake()
+{
+  if (!isDimmed) return false;
+  bool armed = (uiMillis() - dimmedAt) >= SAFE_WAKE_ARM_MS;
+  recordActivity();
+  return armed;
+}
+
+// Records a detent and decides its step size: three detents inside
+// ACCEL_WINDOW_MS means the user is spinning, so step 2°F. Capped at 2 so
+// a spin never overshoots by twenty degrees.
+void noteDetent(unsigned long now, int &stepSize)
+{
+  unsigned long oldest = detentTimes[detentIdx];
+  detentTimes[detentIdx] = now;
+  detentIdx = (detentIdx + 1) % 3;
+  stepSize = (oldest != 0 && now - oldest <= ACCEL_WINDOW_MS) ? 2 : 1;
+  lastDetentTime = now;
+}
+
+void applySetpoint(int newTemp)
+{
+  if (newTemp < TEMP_MIN_F) newTemp = TEMP_MIN_F;
+  if (newTemp > TEMP_MAX_F) newTemp = TEMP_MAX_F;
+
+  getActiveSetpoint() = newTemp;
+  pendingTemp[activeSide == SIDE_RIGHT ? 1 : 0] = true;
+  Serial.printf("Setpoint %s -> %d°F\n", activeSide == SIDE_RIGHT ? "right" : "left", newTemp);
+
+  lastSetpointChangeTime = uiMillis();
+  pendingApiUpdate = true;
+  drawTemperatureUI();
+}
+
+// Local power state flips immediately; the arc cap stays hollow until the
+// Pod confirms on the next flush.
+void setActivePower(bool on)
+{
+  if (activeSide == SIDE_RIGHT)
+  {
+    rightPowerOn = on;
+    pendingPower[1] = true;
+  }
+  else
+  {
+    leftPowerOn = on;
+    pendingPower[0] = true;
+  }
+  Serial.printf("Power %s\n", on ? "ON" : "OFF");
+  feedbackBeep(on ? 2600 : 1800);
+  lastSetpointChangeTime = uiMillis();
+  pendingApiUpdate = true;
+  drawTemperatureUI();
+}
+
+void cycleSide(int direction)
+{
+  unsigned long now = uiMillis();
+  float fromAngle = tweenValue(arcTween, now);
+
+  (void)direction; // two sides: any switch is a toggle
+  activeSide = (activeSide == SIDE_LEFT) ? SIDE_RIGHT : SIDE_LEFT;
+  offDetentAccum = 0;
+  Serial.printf("Side -> %s\n", activeSide == SIDE_RIGHT ? "right" : "left");
+
+  tweenStart(arcTween, fromAngle, setpointAngle(getDisplaySetpoint()), SIDE_SWITCH_MS, now);
+  feedbackBeep(2200);
+  drawTemperatureUI();
+}
+
+void openSettings()
+{
+  inSettingsMenu = true;
+  currentMenuItem = MENU_WIFI_SETTINGS;
+  currentSubMenu = SUBMENU_NONE;
+  lastEncoderPosition = readEncoder();
+  feedbackBeep(2200);
+  drawSettingsMenu();
+}
 
 void handleEncoderInput()
 {
@@ -532,89 +805,125 @@ void handleEncoderInput()
     return;
   }
 
-  long newPosition = M5Dial.Encoder.read();
+  long newPosition = readEncoder();
   long diff = newPosition - lastEncoderPosition;
-  static long encoderAccumulator = 0;
+  if (simulatedEncoderDelta != 0)
+  {
+    diff += simulatedEncoderDelta;
+    simulatedEncoderDelta = 0;
+  }
 
   if (diff != 0)
   {
-    bool wasDimmedNow = isDimmed;
-    encoderAccumulator += diff;
     lastEncoderPosition = newPosition;
+    unsigned long now = uiMillis();
+
+    if (consumeSafeWake()) return;
     recordActivity();
+    if (holdActive) return; // press-and-rotate is reserved; ignore for now
 
-    // First rotation while dimmed only wakes the screen — never
-    // changes the setpoint (accidental bumps in the dark)
-    if (wasDimmedNow)
+    int dir = diff > 0 ? 1 : -1;
+    int count = abs((int)diff);
+    for (int i = 0; i < count; i++)
     {
-      encoderAccumulator = 0;
-    }
-    // 1 encoder count = 1°F step (maximum responsiveness)
-    else if (abs(encoderAccumulator) >= 1)
-    {
-      int steps = encoderAccumulator;
-      encoderAccumulator = 0;
+      int step = 1;
+      noteDetent(now, step);
 
-      int &activeSetpoint = getActiveSetpoint();
-      int newTemp = activeSetpoint + steps;
+      bool powerOn = isActivePowerOn();
+      int current = getDisplaySetpoint();
 
-      if (newTemp < TEMP_MIN_F) newTemp = TEMP_MIN_F;
-      if (newTemp > TEMP_MAX_F) newTemp = TEMP_MAX_F;
-
-      if (newTemp != activeSetpoint)
+      if (!powerOn)
       {
-        activeSetpoint = newTemp;
-
-        if (useFahrenheit)
+        // OFF stop: any upward detent turns the side back on at its last setpoint
+        if (dir > 0)
         {
-          Serial.printf("Encoder: %s %d°F\n",
-                        rightSideActive ? "Right" : "Left", activeSetpoint);
+          offDetentAccum = 0;
+          setActivePower(true);
+        }
+        continue;
+      }
+
+      if (dir < 0 && current <= TEMP_MIN_F)
+      {
+        // Past the minimum: count detents toward the OFF stop
+        offDetentAccum++;
+        if (offDetentAccum >= OFF_DETENTS)
+        {
+          offDetentAccum = 0;
+          setActivePower(false);
         }
         else
         {
-          Serial.printf("Encoder: %s %.1f°C\n",
-                        rightSideActive ? "Right" : "Left", fahrenheitToCelsius(activeSetpoint));
+          drawTemperatureUI(); // show the "off" hint building
         }
-        drawTemperatureUI();
-
-        // Schedule debounced API update
-        lastSetpointChangeTime = millis();
-        pendingApiUpdate = true;
+        continue;
       }
+
+      offDetentAccum = 0;
+      applySetpoint(current + dir * step);
     }
   }
+}
 
-  // Encoder button: single-click = power toggle, double-click = reset to default
-  if (M5Dial.BtnA.wasPressed())
+// Press-and-hold. A short press of the dial is a click (toggle power).
+// Holding the dial or the screen fills a ring and opens settings when it
+// completes. Releasing early does nothing.
+void handleHold(unsigned long now)
+{
+  if (inSettingsMenu) return;
+
+  bool btn = M5Dial.BtnA.isPressed();
+  auto touch = M5Dial.Touch.getDetail();
+  bool tch = touch.isPressed();
+
+  if (!holdActive)
   {
-    unsigned long now = millis();
-
-    if (waitingForEncoderDoubleClick && (now - lastEncoderButtonTime < DOUBLE_CLICK_WINDOW_MS))
+    if (btn || tch)
     {
-      waitingForEncoderDoubleClick = false;
-      getActiveSetpoint() = TEMP_DEFAULT_F;
-      Serial.printf("Double-click: Reset %s to %d°F\n",
-                    rightSideActive ? "Right" : "Left", TEMP_DEFAULT_F);
-      feedbackBeep(2500);
-      recordActivity();
-      drawTemperatureUI();
-      lastSetpointChangeTime = millis();
-      pendingApiUpdate = true;
-    }
-    else
-    {
-      bool wasDimmed = isDimmed;
-      recordActivity();
-      if (wasDimmed)
+      if (consumeSafeWake())
       {
-        Serial.println("Encoder button woke screen");
+        holdConsumed = true; // wake only; ignore this press entirely
       }
       else
       {
-        waitingForEncoderDoubleClick = true;
-        lastEncoderButtonTime = now;
+        holdConsumed = false;
+        recordActivity();
       }
+      holdActive = true;
+      holdIsTouch = tch && !btn;
+      holdStartTime = now;
     }
+    return;
+  }
+
+  bool stillHeld = holdIsTouch ? tch : btn;
+  unsigned long held = now - holdStartTime;
+
+  if (stillHeld)
+  {
+    if (!holdConsumed && held >= SETTINGS_HOLD_MS)
+    {
+      holdActive = false;
+      holdConsumed = true;
+      openSettings();
+    }
+    else if (holdIsTouch && (touch.isFlicking() || touch.wasFlicked()))
+    {
+      holdConsumed = true; // a drag is not a hold
+    }
+    return;
+  }
+
+  // Released
+  holdActive = false;
+  if (holdConsumed) return;
+  if (!holdIsTouch && held < CLICK_MAX_MS)
+  {
+    setActivePower(!isActivePowerOn());
+  }
+  else
+  {
+    drawTemperatureUI(); // clear the partial ring
   }
 }
 
@@ -624,420 +933,574 @@ void handleTouchInput()
 {
   auto touch = M5Dial.Touch.getDetail();
 
-  if (touch.wasPressed())
+  if (inSettingsMenu)
   {
-    // First touch while dimmed only wakes the screen — never acts.
-    // Prevents accidental brushes in the dark from changing anything.
-    if (isDimmed)
+    if (!touch.wasPressed()) return;
+    recordActivity();
+
+    if (currentSubMenu == SUBMENU_IP_EDITOR)
     {
-      recordActivity();
-      return;
-    }
-
-    bool isCenterTouch = !inSettingsMenu &&
-                         abs(touch.x - centerX) < 60 &&
-                         abs(touch.y - centerY) < 60;
-
-    if (!isCenterTouch)
-    {
-      recordActivity();
-    }
-
-    // Settings menu touch handling
-    if (inSettingsMenu)
-    {
-      if (currentSubMenu == SUBMENU_IP_EDITOR)
-      {
-        // Tap saves, as the on-screen hint promises
-        saveIPFromEditor();
-        currentSubMenu = SUBMENU_NONE;
-        lastEncoderPosition = M5Dial.Encoder.read();
-        drawSettingsMenu();
-        return;
-      }
-      else if (currentSubMenu != SUBMENU_NONE)
-      {
-        currentSubMenu = SUBMENU_NONE;
-        lastEncoderPosition = M5Dial.Encoder.read();
-        drawSettingsMenu();
-        return;
-      }
-      else
-      {
-        inSettingsMenu = false;
-        drawTemperatureUI();
-        return;
-      }
-    }
-
-    // Center touch — wait for release to determine action
-    if (abs(touch.x - centerX) < 60 && abs(touch.y - centerY) < 60)
-    {
-      centerTouchStartTime = millis();
-      centerTouchActive = true;
-      return;
-    }
-
-    // Bottom buttons (hitbox larger than the drawn circle for easier
-    // targeting)
-    const int buttonY = SCREEN_HEIGHT - 55;
-    const int hitRadius = 28;
-    const int leftButtonX = 50;
-    const int rightButtonX = SCREEN_WIDTH - 50;
-
-    // Left button (active side label) — tap to toggle side
-    if (abs(touch.x - leftButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
-    {
-      rightSideActive = !rightSideActive;
-      Serial.printf("Switched to %s side\n", rightSideActive ? "Right" : "Left");
-      drawTemperatureUI();
-      return;
-    }
-
-    // Right button (gear icon) — open settings
-    if (abs(touch.x - rightButtonX) < hitRadius && abs(touch.y - buttonY) < hitRadius)
-    {
-      inSettingsMenu = true;
-      lastEncoderPosition = M5Dial.Encoder.read();
-      Serial.println("Gear button: opened settings");
+      // Tap saves, as the on-screen hint promises
+      saveIPFromEditor();
+      currentSubMenu = SUBMENU_NONE;
+      lastEncoderPosition = readEncoder();
       drawSettingsMenu();
-      return;
     }
-
-    // Temperature arc touch
-    int dx = touch.x - centerX;
-    int dy = touch.y - centerY;
-    float distance = sqrt(dx * dx + dy * dy);
-
-    if (distance > arcRadius - arcThickness - 10 && distance < arcRadius + 30)
+    else if (currentSubMenu != SUBMENU_NONE)
     {
-      float angle = atan2(dy, dx) * 180.0 / PI;
-      if (angle < 0) angle += 360;
-
-      int newTemp;
-      if (angle >= 165 && angle <= 360)
-      {
-        newTemp = (int)round(mapFloat(angle, 165, 375, TEMP_MIN_F, TEMP_MAX_F));
-      }
-      else if (angle >= 0 && angle <= 15)
-      {
-        float normalizedAngle = angle + 360;
-        newTemp = (int)round(mapFloat(normalizedAngle, 165, 375, TEMP_MIN_F, TEMP_MAX_F));
-      }
-      else
-      {
-        return;
-      }
-
-      if (newTemp < TEMP_MIN_F) newTemp = TEMP_MIN_F;
-      if (newTemp > TEMP_MAX_F) newTemp = TEMP_MAX_F;
-
-      getActiveSetpoint() = newTemp;
-      Serial.printf("Touch set %s: %d°F\n",
-                    rightSideActive ? "Right" : "Left", getActiveSetpoint());
-      drawTemperatureUI();
-
-      lastSetpointChangeTime = millis();
-      pendingApiUpdate = true;
-    }
-  }
-
-  // Touch release — center area duration-based actions
-  if (touch.wasReleased() && centerTouchActive)
-  {
-    centerTouchActive = false;
-    unsigned long now = millis();
-    unsigned long touchDuration = now - centerTouchStartTime;
-
-    if (touchDuration < CLICK_MAX_MS)
-    {
-      if (waitingForDoubleClick && (now - lastCenterTapTime < DOUBLE_CLICK_WINDOW_MS))
-      {
-        // Double-click: reset setpoint
-        waitingForDoubleClick = false;
-        getActiveSetpoint() = TEMP_DEFAULT_F;
-        Serial.printf("Double-click: Reset %s to %d°F\n",
-                      rightSideActive ? "Right" : "Left", TEMP_DEFAULT_F);
-        feedbackBeep(2500);
-        if (isDimmed) { isDimmed = false; lastActivityTime = millis(); }
-        drawTemperatureUI();
-        lastSetpointChangeTime = millis();
-        pendingApiUpdate = true;
-      }
-      else
-      {
-        // First click — wait for possible double-click
-        waitingForDoubleClick = true;
-        lastCenterTapTime = now;
-        if (isDimmed)
-        {
-          isDimmed = false;
-          lastActivityTime = millis();
-          updateBrightness();
-          waitingForDoubleClick = false; // Don't toggle power when waking
-        }
-      }
-    }
-    else if (touchDuration < NIGHT_MODE_MAX_MS)
-    {
-      // Medium hold: force the opposite of the current mode
-      waitingForDoubleClick = false;
-      nightOverride = isNightTime() ? NIGHT_FORCE_OFF : NIGHT_FORCE_ON;
-      preferences.putUChar("nightOvr", (uint8_t)nightOverride);
-      Serial.printf("Night mode override: %s\n",
-                    nightOverride == NIGHT_FORCE_ON ? "forced on" : "forced off");
-      drawTemperatureUI();
+      currentSubMenu = SUBMENU_NONE;
+      lastEncoderPosition = readEncoder();
+      drawSettingsMenu();
     }
     else
     {
-      // Long hold: open settings
-      waitingForDoubleClick = false;
-      inSettingsMenu = true;
-      currentMenuItem = MENU_WIFI_SETTINGS;
-      currentSubMenu = SUBMENU_NONE;
-      drawSettingsMenu();
+      inSettingsMenu = false;
+      lastEncoderPosition = readEncoder();
+      holdActive = false;
+      holdConsumed = true; // the exit tap must not register as a hold
+      drawTemperatureUI();
+    }
+    return;
+  }
+
+  // Main screen: taps on the two glyphs in the arc opening. Holds are
+  // handled by handleHold(); nothing else on the screen reacts to touch.
+  if (touch.wasClicked())
+  {
+    if (isDimmed) return; // handleHold already woke the screen
+    int dxp = touch.x - GLYPH_POWER_X, dyp = touch.y - GLYPH_Y;
+    int dxg = touch.x - GLYPH_GEAR_X, dyg = touch.y - GLYPH_Y;
+    if (dxp * dxp + dyp * dyp <= GLYPH_HIT_R * GLYPH_HIT_R)
+    {
+      holdConsumed = true;
+      setActivePower(!isActivePowerOn());
+    }
+    else if (dxg * dxg + dyg * dyg <= GLYPH_HIT_R * GLYPH_HIT_R)
+    {
+      holdConsumed = true;
+      openSettings();
     }
   }
 }
 
-// ==================== Display ====================
 
+// ==================== Display: main screen ====================
+
+// Callers that changed state ask for a frame; the loop renders it on the
+// next pass (or animates toward it).
 void drawTemperatureUI()
 {
-  bool nightMode = isNightTime();
+  uiDirty = true;
+}
 
-  uint16_t bgColor = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
-  uint16_t arcBgColor = nightMode ? COLOR_NIGHT_ARC_BG : COLOR_ARC_BG;
-  uint16_t textColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
-  uint16_t setpointColor = nightMode ? COLOR_NIGHT_SETPOINT : COLOR_SETPOINT;
+void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now)
+{
+  t.from = from;
+  t.to = to;
+  t.t0 = now;
+  t.dur = dur < 1 ? 1 : dur;
+  t.active = (from != to);
+}
 
-  sprite.fillSprite(bgColor);
+static float easeOutCubic(float p) { return 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p); }
+static float easeInOutCubic(float p)
+{
+  return p < 0.5f ? 4.0f * p * p * p : 1.0f - powf(-2.0f * p + 2.0f, 3.0f) / 2.0f;
+}
 
-  // Arc geometry
-  const float startAngle = 165.0f;
-  const float endAngle = 375.0f;
-  const float totalArcDegrees = endAngle - startAngle; // 210 degrees
-  const int arcMidRadius = arcRadius - arcThickness / 2;
-  const int capRadius = arcThickness / 2;
-
-  // Background arc
-  sprite.fillArc(centerX, centerY, arcRadius, arcRadius - arcThickness, startAngle, endAngle, arcBgColor);
-
-  // Colored gradient arc up to current setpoint (small segments for smooth gradient)
-  int activeTemp = getActiveSetpoint();
-  float tempPercent = (float)(activeTemp - TEMP_MIN_F) / (float)(TEMP_MAX_F - TEMP_MIN_F);
-  float currentAngle = startAngle + tempPercent * totalArcDegrees;
-
-  for (float angle = startAngle; angle < currentAngle; angle += 3.0f)
+float tweenValue(Tween &t, unsigned long now)
+{
+  if (!t.active) return t.to;
+  float p = (float)(now - t.t0) / (float)t.dur;
+  if (p >= 1.0f)
   {
-    float segEnd = angle + 3.5f;
-    if (segEnd > currentAngle) segEnd = currentAngle + 0.5f;
-
-    float arcPercent = (angle - startAngle) / totalArcDegrees;
-    uint16_t color;
-    if (nightMode)
-      color = getTemperatureColorNight(arcPercent);
-    else
-      color = getTemperatureColor(arcPercent);
-
-    sprite.fillArc(centerX, centerY, arcRadius, arcRadius - arcThickness, angle, segEnd, color);
+    t.active = false;
+    return t.to;
   }
+  return t.from + (t.to - t.from) * easeInOutCubic(p);
+}
 
-  // Rounded end caps (anti-aliased)
-  float startRad = fmodf(startAngle, 360.0f) * PI / 180.0f;
-  int startCapX = centerX + cos(startRad) * arcMidRadius;
-  int startCapY = centerY + sin(startRad) * arcMidRadius;
-  uint16_t startColor = nightMode ? getTemperatureColorNight(0.0f) : getTemperatureColor(0.0f);
-  sprite.fillSmoothCircle(startCapX, startCapY, capRadius, startColor);
+float setpointAngle(int tempF)
+{
+  float pct = (float)(tempF - TEMP_MIN_F) / (float)(TEMP_MAX_F - TEMP_MIN_F);
+  if (pct < 0) pct = 0;
+  if (pct > 1) pct = 1;
+  return ARC_START + pct * ARC_SPAN;
+}
 
-  float endRad = fmodf(currentAngle, 360.0f) * PI / 180.0f;
-  int endCapX = centerX + cos(endRad) * arcMidRadius;
-  int endCapY = centerY + sin(endRad) * arcMidRadius;
-  uint16_t endColor = nightMode ? getTemperatureColorNight(tempPercent) : getTemperatureColor(tempPercent);
-  sprite.fillSmoothCircle(endCapX, endCapY, capRadius, endColor);
-
-  // Active setpoint indicator line
+Theme currentTheme()
+{
+  Theme th;
+  th.night = isNightTime();
+  if (th.night)
   {
-    int lineInner = arcRadius - arcThickness - 3;
-    int lineOuter = arcRadius + 3;
-    uint16_t lineColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
-    int lx1 = centerX + cos(endRad) * lineInner;
-    int ly1 = centerY + sin(endRad) * lineInner;
-    int lx2 = centerX + cos(endRad) * lineOuter;
-    int ly2 = centerY + sin(endRad) * lineOuter;
-    sprite.drawLine(lx1, ly1, lx2, ly2, lineColor);
-    float offsetRad = endRad + 0.008f;
-    sprite.drawLine(
-        centerX + (int)(cos(offsetRad) * lineInner),
-        centerY + (int)(sin(offsetRad) * lineInner),
-        centerX + (int)(cos(offsetRad) * lineOuter),
-        centerY + (int)(sin(offsetRad) * lineOuter), lineColor);
-  }
-
-  // Power state of active side
-  bool activePowerOn = rightSideActive ? rightPowerOn : leftPowerOn;
-
-  // Temperature value in center
-  sprite.setTextColor(activePowerOn ? textColor : arcBgColor);
-  sprite.setTextDatum(middle_center);
-  sprite.setFont(&fonts::FreeSansBold24pt7b);
-
-  char tempStr[10];
-  if (useFahrenheit)
-  {
-    snprintf(tempStr, sizeof(tempStr), "%d", activeTemp);
+    th.bg = UI_N_BG;
+    th.track = UI_N_LOW;
+    th.muted = UI_N_LOW;
+    th.secondary = UI_N_MID;
+    th.text = UI_N_HIGH;
+    th.alert = UI_N_HIGH;
+    th.cool = UI_N_MID;
+    th.warm = UI_N_MID;
   }
   else
   {
-    float tempC = fahrenheitToCelsius((float)activeTemp);
-    snprintf(tempStr, sizeof(tempStr), "%.1f", tempC);
+    th.bg = UI_BG;
+    th.track = UI_TRACK;
+    th.muted = UI_MUTED;
+    th.secondary = UI_SECONDARY;
+    th.text = UI_TEXT;
+    th.alert = UI_ALERT;
+    th.cool = UI_COOL;
+    th.warm = UI_WARM;
+  }
+  return th;
+}
+
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
+{
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
+// Arc gradient: five perceptual stops, cold-water blue through a body-neutral
+// warm white to red-orange. Night is a two-stop red ramp.
+uint16_t arcColor(float percent, const Theme &th)
+{
+  if (percent < 0.0f) percent = 0.0f;
+  if (percent > 1.0f) percent = 1.0f;
+
+  if (th.night)
+  {
+    uint8_t r = (uint8_t)(0x88 + (0xE0 - 0x88) * percent);
+    return rgb565(r, 0, 0);
   }
 
-  int tempTextWidth = sprite.textWidth(tempStr);
-  sprite.drawString(tempStr, centerX, centerY - 10);
+  static const float stops[5] = {0.0f, 10.0f / 55.0f, 25.0f / 55.0f, 40.0f / 55.0f, 1.0f};
+  static const uint8_t rgb[5][3] = {
+      {0x3B, 0x8B, 0xFF}, // 55°F
+      {0x35, 0xC4, 0xE0}, // 65°F
+      {0xE8, 0xE4, 0xDC}, // 80°F
+      {0xFF, 0xA5, 0x3C}, // 95°F
+      {0xFF, 0x5A, 0x3C}  // 110°F
+  };
+  int i = 0;
+  while (i < 3 && percent > stops[i + 1]) i++;
+  float t = (percent - stops[i]) / (stops[i + 1] - stops[i]);
+  uint8_t r = rgb[i][0] + (int)((rgb[i + 1][0] - rgb[i][0]) * t);
+  uint8_t g = rgb[i][1] + (int)((rgb[i + 1][1] - rgb[i][1]) * t);
+  uint8_t b = rgb[i][2] + (int)((rgb[i + 1][2] - rgb[i][2]) * t);
+  return rgb565(r, g, b);
+}
 
-  // Unit indicator (°F / °C)
-  int unitX = centerX + tempTextWidth / 2 + 4;
-  int unitY = centerY - 20;
-  uint16_t unitColor = nightMode ? 0x4000 : 0x6B4D;
-  sprite.drawCircle(unitX + 2, unitY - 4, 3, activePowerOn ? unitColor : arcBgColor);
+static uint16_t lerp565(uint16_t a, uint16_t b, float t)
+{
+  int ar = (a >> 11) & 0x1F, ag = (a >> 5) & 0x3F, ab = a & 0x1F;
+  int br = (b >> 11) & 0x1F, bg = (b >> 5) & 0x3F, bb = b & 0x1F;
+  int r = ar + (int)((br - ar) * t);
+  int g = ag + (int)((bg - ag) * t);
+  int bl = ab + (int)((bb - ab) * t);
+  return (r << 11) | (g << 5) | bl;
+}
+
+static void polar(float deg, int r, int &x, int &y)
+{
+  float rad = deg * PI / 180.0f;
+  x = centerX + (int)lroundf(cosf(rad) * r);
+  y = centerY + (int)lroundf(sinf(rad) * r);
+}
+
+// Draws the numeral with a small degree mark and unit to its upper right
+static void drawTemperatureNumeral(int tempF, int cx, int cy, const lgfx::IFont *font,
+                                   uint16_t color, uint16_t unitColor, bool showUnit)
+{
+  char buf[10];
+  if (useFahrenheit) snprintf(buf, sizeof(buf), "%d", tempF);
+  else snprintf(buf, sizeof(buf), "%.1f", fahrenheitToCelsius((float)tempF));
+
+  sprite.setFont(font);
+  sprite.setTextColor(color);
+  sprite.setTextDatum(middle_center);
+  sprite.drawString(buf, cx, cy);
+
+  if (!showUnit) return;
+  int w = sprite.textWidth(buf);
+  int h = sprite.fontHeight();
+  int ux = cx + w / 2 + 6;
+  int uy = cy - h / 2 + 12;
+  sprite.drawCircle(ux + 3, uy - 6, 3, unitColor);
   sprite.setFont(&fonts::FreeSans12pt7b);
-  sprite.setTextColor(activePowerOn ? unitColor : arcBgColor);
+  sprite.setTextColor(unitColor);
   sprite.setTextDatum(middle_left);
-  sprite.drawString(useFahrenheit ? "F" : "C", unitX + 7, unitY + 4);
+  sprite.drawString(useFahrenheit ? "F" : "C", ux + 8, uy);
   sprite.setTextDatum(middle_center);
+}
 
-  // Status text below target — show heating/cooling direction, hide when at target
-  if (activePowerOn)
+// "label · value" on one line, centred. Fonts lack a middle dot, so draw one.
+static void drawStatusLine(const char *label, const char *value, int y, uint16_t color)
+{
+  sprite.setFont(&fonts::FreeSans9pt7b);
+  sprite.setTextColor(color);
+  sprite.setTextDatum(middle_center);
+  if (!value || !*value)
   {
-    int activeCurrentF = rightSideActive ? rightCurrentTempF : leftCurrentTempF;
-    int diff = activeTemp - activeCurrentF;
+    sprite.drawString(label, centerX, y);
+    return;
+  }
+  int wl = sprite.textWidth(label);
+  int wv = sprite.textWidth(value);
+  const int gap = 14;
+  int total = wl + gap + wv;
+  int x0 = centerX - total / 2;
+  sprite.setTextDatum(middle_left);
+  sprite.drawString(label, x0, y);
+  sprite.fillSmoothCircle(x0 + wl + gap / 2, y, 1, color);
+  sprite.drawString(value, x0 + wl + gap, y);
+  sprite.setTextDatum(middle_center);
+}
 
-    if (diff != 0)
+static void formatTemp(int tempF, char *buf, size_t n)
+{
+  if (useFahrenheit) snprintf(buf, n, "%d", tempF);
+  else snprintf(buf, n, "%.1f", fahrenheitToCelsius((float)tempF));
+}
+
+void buildArcTable()
+{
+  const int R = ARC_R_OUTER + 1;
+  const int maxLen = (2 * R + 1) * (2 * R + 1);
+  ArcPx *tmp = (ArcPx *)malloc(sizeof(ArcPx) * 9000);
+  if (!tmp) return;
+  int n = 0;
+  for (int dy = -R; dy <= R && n < 9000; dy++)
+  {
+    for (int dx = -R; dx <= R && n < 9000; dx++)
     {
-      sprite.setFont(&fonts::FreeSans9pt7b);
-      uint16_t statusColor = nightMode ? 0x4000 : 0x6B4D;
-      sprite.setTextColor(statusColor);
-      sprite.setTextDatum(middle_center);
-
-      sprite.drawString((diff > 0) ? "heating" : "cooling", centerX, centerY + 25);
+      float r = sqrtf((float)(dx * dx + dy * dy));
+      float cov = fminf(1.0f, (ARC_R_OUTER + 0.5f) - r) * fminf(1.0f, r - (ARC_R_INNER - 0.5f));
+      if (cov <= 0.0f) continue;
+      float ang = atan2f((float)dy, (float)dx) * 180.0f / PI; // 0° = 3 o'clock, clockwise
+      float rel = ang - ARC_START;
+      while (rel < 0) rel += 360.0f;
+      if (rel > ARC_SPAN) continue;
+      int px = centerX + dx, py = centerY + dy;
+      if (px < 0 || py < 0 || px >= SCREEN_WIDTH || py >= SCREEN_HEIGHT) continue;
+      uint8_t a = (uint8_t)lroundf(cov * 15.0f);
+      if (a == 0) continue;
+      tmp[n].offset = (uint16_t)(py * SCREEN_WIDTH + px);
+      tmp[n].packed = (uint16_t)((a << 12) | ((int)(rel * 10.0f) & 0x0FFF));
+      n++;
     }
   }
+  (void)maxLen;
+  arcTable = (ArcPx *)realloc(tmp, sizeof(ArcPx) * (n > 0 ? n : 1));
+  arcTableLen = n;
+  Serial.printf("Arc table: %d px, %u bytes\n", n, (unsigned)(n * sizeof(ArcPx)));
+}
 
-  // OFF indicator
-  if (!activePowerOn)
+// Writes the track and the fill straight into the sprite buffer. Angles are
+// absolute (ARC_START..ARC_START+ARC_SPAN). Solid gradient up to solidAngle.
+// Between spanFrom and spanTo the gradient sits at 40% ("not yet") with a
+// soft gaussian highlight centred at glow10 (relative 0.1°, <0 for none,
+// width sigma10) travelling toward the target; when the span is too short
+// for a blob, the whole span pulses by `pulse` (0..1) instead. Pass
+// solidAngle < ARC_START for no fill. grey draws in the muted colour
+// (Wi-Fi down: the arc is stale).
+void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th)
+{
+  if (!arcTable) return;
+  if (gradientLutNight != (int)th.night)
   {
-    sprite.setFont(&fonts::FreeSansBold12pt7b);
-    sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
-    sprite.drawString("OFF", centerX, centerY + 25);
+    for (int i = 0; i < 256; i++) gradientLut[i] = arcColor(i / 255.0f, th);
+    gradientLutNight = (int)th.night;
   }
-
-  // Connection status / clock at bottom
-  sprite.setFont(&fonts::Font0);
-  sprite.setTextDatum(middle_center);
-
-  if (!wifiConnected)
+  int solid10 = (int)((solidAngle - ARC_START) * 10.0f);
+  int span0 = (int)((spanFrom - ARC_START) * 10.0f);
+  int span1 = (int)((spanTo - ARC_START) * 10.0f);
+  const float baseMix = glow10 >= 0 ? 0.40f : (0.35f + 0.65f * pulse);
+  const float inv2s2 = sigma10 > 0 ? 1.0f / (2.0f * (float)sigma10 * (float)sigma10) : 0.0f;
+  const int reach = sigma10 * 3;
+  uint16_t *buf = (uint16_t *)sprite.getBuffer();
+  const uint16_t bg = th.bg;
+  for (int i = 0; i < arcTableLen; i++)
   {
-    // Show WiFi disconnected prominently
-    sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
-    sprite.drawString("WiFi Disconnected", centerX, SCREEN_HEIGHT - 28);
-    sprite.setTextColor(textColor);
-    sprite.drawString("Open settings to connect", centerX, SCREEN_HEIGHT - 16);
-  }
-  else
-  {
-    if (!podReachable)
+    uint16_t packed = arcTable[i].packed;
+    int a10 = packed & 0x0FFF;
+    uint8_t cov = packed >> 12;
+    uint16_t c;
+    if (a10 <= solid10)
     {
-      sprite.setTextColor(nightMode ? COLOR_NIGHT_ARC_HOT : COLOR_ARC_HOT);
-      sprite.drawString("Pod offline", centerX, SCREEN_HEIGHT - 34);
+      c = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
     }
-    if (timeInitialized)
+    else if (a10 > span0 && a10 <= span1)
     {
-      sprite.setTextColor(textColor);
-      struct tm timeinfo;
-      if (getLocalTime(&timeinfo))
+      uint16_t g = grey ? th.muted : gradientLut[(a10 * 255) / 2700];
+      float mix = baseMix;
+      if (glow10 >= 0)
       {
-        char timeStr[10];
-        snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
-                 timeinfo.tm_hour, timeinfo.tm_min);
-        sprite.drawString(timeStr, centerX, SCREEN_HEIGHT - 22);
+        int d = a10 - glow10;
+        if (d < 0) d = -d;
+        if (d < reach) mix += (1.0f - baseMix) * expf(-(float)(d * d) * inv2s2);
+      }
+      c = lerp565(bg, g, mix);
+    }
+    else
+    {
+      c = th.track;
+    }
+    if (cov < 15) c = lerp565(bg, c, cov / 15.0f);
+    buf[arcTable[i].offset] = __builtin_bswap16(c);
+  }
+}
+
+void renderMainScreen(unsigned long now)
+{
+  Theme th = currentTheme();
+  sprite.fillSprite(th.bg);
+
+  int shownF = getDisplaySetpoint();
+  bool powerOn = isActivePowerOn();
+  bool online = wifiConnected && podReachable;
+  bool unconfirmed = pendingApiUpdate || !online;
+
+  // Arc target: snap while the encoder is moving, settle once it stops
+  float targetAngle = powerOn ? setpointAngle(shownF) : ARC_START;
+  if (!arcTween.active && arcTween.to != targetAngle)
+  {
+    bool moving = (now - lastDetentTime) < 100;
+    if (moving) arcTween.to = targetAngle;
+    else tweenStart(arcTween, arcTween.to, targetAngle, ARC_SETTLE_MS, now);
+  }
+  else if (arcTween.active && arcTween.to != targetAngle)
+  {
+    tweenStart(arcTween, tweenValue(arcTween, now), targetAngle, ARC_SETTLE_MS, now);
+  }
+  float fillAngle = tweenValue(arcTween, now);
+
+  uint32_t tS = micros();
+  // ---- Track, solid fill to the mattress temperature, hashed span to the target ----
+  int currentF = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
+  int diff = shownF - currentF;
+  bool converging = powerOn && online && abs(diff) > 1;
+  float solidAngle = powerOn ? fillAngle : ARC_START - 1.0f;
+  float spanFrom = ARC_START - 1.0f, spanTo = ARC_START - 1.0f;
+  int glow10 = -1, sigma10 = 0;
+  float pulse = 0.0f;
+  if (converging)
+  {
+    float curAngle = setpointAngle(currentF);
+    solidAngle = fminf(curAngle, fillAngle);
+    spanFrom = solidAngle;
+    spanTo = fmaxf(curAngle, fillAngle);
+    // Shimmer: a soft highlight travels along the span in the arc's own
+    // direction (from the solid fill outward, whether heating or cooling),
+    // eases in and out, then rests before restarting. Too short a span for
+    // a blob pulses instead.
+    const unsigned long travel = th.night ? 4000 : 2600, rest = 400;
+    unsigned long t = now % (travel + rest);
+    if (spanTo - spanFrom >= 24.0f)
+    {
+      if (t < travel)
+      {
+        float p = (float)t / (float)travel;
+        p = -(cosf(PI * p) - 1.0f) / 2.0f; // ease-in-out sine
+        float pos = spanFrom + (spanTo - spanFrom) * p;
+        glow10 = (int)((pos - ARC_START) * 10.0f);
+      }
+      else
+      {
+        glow10 = 0x7FFF; // resting: base only, no highlight anywhere
+      }
+      sigma10 = th.night ? 80 : 60;
+    }
+    else
+    {
+      float ph = (float)(now % 2400) / 2400.0f;
+      pulse = 0.5f + 0.5f * sinf(ph * 2.0f * PI);
+    }
+  }
+  drawArcRing(solidAngle, spanFrom, spanTo, glow10, sigma10, pulse, !wifiConnected, th);
+  uint16_t fillDim = th.muted;
+  if (converging)
+  {
+    // Round off the far end of the span in its own (dim, maybe highlighted) colour
+    float mix = glow10 >= 0 ? 0.40f : (0.35f + 0.65f * pulse);
+    int end10 = (int)((spanTo - ARC_START) * 10.0f);
+    if (glow10 >= 0 && sigma10 > 0)
+    {
+      int d = end10 - glow10;
+      if (d < 0) d = -d;
+      if (d < sigma10 * 3) mix += (1.0f - mix) * expf(-(float)(d * d) / (2.0f * (float)sigma10 * (float)sigma10));
+    }
+    uint16_t g = wifiConnected ? arcColor((spanTo - ARC_START) / ARC_SPAN, th) : fillDim;
+    int x, y;
+    polar(spanTo, ARC_R_MID, x, y);
+    sprite.fillSmoothCircle(x, y, ARC_CAP_R, lerp565(th.bg, g, mix));
+  }
+  {
+    int x, y;
+    polar(ARC_START, ARC_R_MID, x, y);
+    bool filled = powerOn && fillAngle > ARC_START + 0.5f;
+    sprite.fillSmoothCircle(x, y, ARC_CAP_R, filled ? (wifiConnected ? arcColor(0.0f, th) : fillDim) : th.track);
+    polar(ARC_START + ARC_SPAN, ARC_R_MID, x, y);
+    sprite.fillSmoothCircle(x, y, ARC_CAP_R, th.track);
+
+    if (filled)
+    {
+      uint16_t capColor = wifiConnected ? arcColor((fillAngle - ARC_START) / ARC_SPAN, th) : fillDim;
+      polar(fillAngle, ARC_R_MID, x, y);
+      sprite.fillSmoothCircle(x, y, ARC_CAP_R, capColor);
+      if (unconfirmed)
+      {
+        // Hollow cap: sent but not yet acknowledged, or Pod unreachable
+        sprite.fillSmoothCircle(x, y, ARC_CAP_R - 2, th.bg);
       }
     }
   }
 
-  // Bottom buttons
-  const int buttonY = SCREEN_HEIGHT - 55;
-  const int leftButtonX = 50;
-  const int rightButtonX = SCREEN_WIDTH - 50;
-  const int btnRadius = 18;
-
-  // Left button — active side initial
-  String &activeName = rightSideActive ? rightSideName : leftSideName;
-  sprite.fillSmoothCircle(leftButtonX, buttonY, btnRadius, setpointColor);
-  sprite.setTextColor(bgColor);
-  sprite.setTextDatum(middle_center);
+  sectUs[0] = micros() - tS; tS = micros();
+  // ---- Your side's name at the top ----
   {
-    String label = activeName.substring(0, 2);
-    sprite.setFont(label.length() <= 1 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSans9pt7b);
-    sprite.drawString(label.c_str(), leftButtonX, buttonY);
+    String name = fitText(activeSide == SIDE_RIGHT ? rightSideName : leftSideName, 10);
+    sprite.setFont(&fonts::FreeSans9pt7b);
+    sprite.setTextDatum(middle_center);
+    sprite.setTextColor(powerOn ? th.secondary : th.muted);
+    sprite.drawString(name.c_str(), centerX, 50);
   }
 
-  // Right button — gear icon (settings)
-  sprite.fillSmoothCircle(rightButtonX, buttonY, btnRadius, arcBgColor);
+  sectUs[1] = micros() - tS; tS = micros();
+  // ---- Numeral ----
+  uint16_t numColor = powerOn ? (online ? th.text : th.secondary) : th.muted;
+  drawTemperatureNumeral(shownF, centerX, 116, &fonts::DejaVu56, numColor, th.secondary, true);
+
+  // ---- Status line ----
   {
-    // Draw 3 horizontal bars (hamburger/settings icon)
-    uint16_t gearColor = textColor;
-    int bw = 12; // bar width
-    int bh = 2;  // bar height
-    int gap = 5; // gap between bars
-    for (int i = -1; i <= 1; i++)
+    const int y = 160;
+    char val[12];
+    if (!wifiConnected)
     {
-      sprite.fillRect(rightButtonX - bw / 2, buttonY + i * gap - bh / 2, bw, bh, gearColor);
+      // handled below, at the clock position
+    }
+    else if (!podReachable)
+    {
+      drawStatusLine("Pod offline", "", y, th.alert);
+    }
+    else if (!powerOn)
+    {
+      formatTemp(currentF, val, sizeof(val));
+      drawStatusLine("Off", val, y, th.muted);
+    }
+    else if (offDetentAccum > 0)
+    {
+      drawStatusLine("turn once more for off", "", y, th.secondary);
+    }
+    else if (abs(diff) <= 1)
+    {
+      formatTemp(currentF, val, sizeof(val));
+      drawStatusLine("at", val, y, th.secondary);
+    }
+    else
+    {
+      formatTemp(currentF, val, sizeof(val));
+      drawStatusLine(diff > 0 ? "heating" : "cooling", val, y, diff > 0 ? th.warm : th.cool);
     }
   }
 
-  // Push to display
+  // ---- Clock / connectivity at the arc opening ----
+  sprite.setTextDatum(middle_center);
+  if (!wifiConnected)
+  {
+    sprite.setFont(&fonts::FreeSans9pt7b);
+    sprite.setTextColor(th.alert);
+    sprite.drawString("No Wi-Fi", centerX, 204);
+    sprite.setFont(&fonts::Font0);
+    sprite.setTextColor(th.muted);
+    sprite.drawString("hold for settings", centerX, 220);
+  }
+  else if (timeInitialized)
+  {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo))
+    {
+      lastDrawnMinute = timeinfo.tm_min;
+      char timeStr[8];
+      snprintf(timeStr, sizeof(timeStr), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+      sprite.setFont(&fonts::Font2);
+      sprite.setTextColor(th.secondary);
+      sprite.drawString(timeStr, centerX, GLYPH_Y);
+    }
+  }
+  if (wifiConnected)
+  {
+    // Power glyph: open ring with a stem. Lit when on, muted when off.
+    uint16_t pc = powerOn ? th.secondary : th.muted;
+    sprite.drawArc(GLYPH_POWER_X, GLYPH_Y, 8, 6, 305, 595, pc);
+    sprite.fillSmoothRoundRect(GLYPH_POWER_X - 1, GLYPH_Y - 10, 3, 9, 1, pc);
+    // Gear glyph: ring with six teeth
+    uint16_t gc = th.muted;
+    sprite.fillSmoothCircle(GLYPH_GEAR_X, GLYPH_Y, 6, gc);
+    for (int i = 0; i < 6; i++)
+    {
+      float a = i * 60.0f * PI / 180.0f;
+      sprite.drawWideLine(GLYPH_GEAR_X + cosf(a) * 4, GLYPH_Y + sinf(a) * 4,
+                          GLYPH_GEAR_X + cosf(a) * 9, GLYPH_Y + sinf(a) * 9, 1.4f, gc);
+    }
+    sprite.fillSmoothCircle(GLYPH_GEAR_X, GLYPH_Y, 2, th.bg);
+  }
+
+  // ---- Settings hold ring (outside the arc) ----
+  if ((holdActive && !holdConsumed) || debugHoldStart)
+  {
+    unsigned long held = debugHoldStart ? now - debugHoldStart : now - holdStartTime;
+    if (held >= HOLD_RING_SHOW_MS)
+    {
+      float p = (float)(held - HOLD_RING_SHOW_MS) / (float)(SETTINGS_HOLD_MS - HOLD_RING_SHOW_MS);
+      if (p > 1.0f) p = 1.0f;
+      p = easeOutCubic(p);
+      sprite.fillArc(centerX, centerY, 118, 113, 270, 270 + 360.0f * p, th.text);
+    }
+  }
+
+  sectUs[2] = micros() - tS; tS = micros();
+  sprite.pushSprite(0, 0);
+  sectUs[3] = micros() - tS;
+}
+
+// Glanceable state at ~1% backlight: only full-value pixels survive, so a
+// single big numeral plus one status dot. No grays, no arc, no clock.
+void renderDimScreen()
+{
+  Theme th = currentTheme();
+  sprite.fillSprite(th.bg);
+
+  bool powerOn = isActivePowerOn();
+  bool online = wifiConnected && podReachable;
+  uint16_t color = th.night ? UI_N_HIGH : UI_TEXT;
+
+  if (powerOn)
+  {
+    drawTemperatureNumeral(getDisplaySetpoint(), centerX, centerY, &fonts::DejaVu72, color, color, false);
+  }
+  else
+  {
+    sprite.setFont(&fonts::FreeSansBold18pt7b);
+    sprite.setTextColor(color);
+    sprite.setTextDatum(middle_center);
+    sprite.drawString("off", centerX, centerY);
+  }
+
+  uint16_t dot = 0;
+  if (!online) dot = th.night ? UI_N_HIGH : UI_ALERT;
+  else if (powerOn)
+  {
+    int currentF = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
+    int diff = getDisplaySetpoint() - currentF;
+    if (abs(diff) > 1) dot = th.night ? UI_N_HIGH : (diff > 0 ? UI_WARM : UI_COOL);
+  }
+  if (dot) sprite.fillSmoothCircle(centerX, 176, 3, dot);
+
   sprite.pushSprite(0, 0);
 }
 
-void updateClockDisplay()
-{
-  if (!timeInitialized) return;
-
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) return;
-
-  // Only redraw when the displayed minute changes — avoids per-second
-  // sprite churn and distracting flicker on a bedside device
-  static int lastDrawnMinute = -1;
-  if (timeinfo.tm_min == lastDrawnMinute) return;
-  lastDrawnMinute = timeinfo.tm_min;
-
-  bool nightMode = isNightTime();
-  uint16_t bgColor = nightMode ? COLOR_NIGHT_BACKGROUND : COLOR_BACKGROUND;
-  uint16_t textColor = nightMode ? COLOR_NIGHT_TEXT : COLOR_TEXT;
-
-  LGFX_Sprite timeSprite(&M5Dial.Display);
-  const int timeWidth = 80;
-  const int timeHeight = 15;
-  const int timeX = centerX - timeWidth / 2;
-  const int timeY = SCREEN_HEIGHT - 22 - (timeHeight / 2);
-
-  timeSprite.createSprite(timeWidth, timeHeight);
-  timeSprite.fillSprite(bgColor);
-
-  timeSprite.setFont(&fonts::Font0);
-  timeSprite.setTextColor(textColor);
-  timeSprite.setTextDatum(middle_center);
-
-  char timeStr[10];
-  snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
-           timeinfo.tm_hour, timeinfo.tm_min);
-  timeSprite.drawString(timeStr, timeWidth / 2, timeHeight / 2);
-
-  timeSprite.pushSprite(timeX, timeY);
-  timeSprite.deleteSprite();
-}
 
 // ==================== Settings Menu ====================
 
@@ -1131,7 +1594,7 @@ void drawSettingsMenu()
 
 void handleEncoderInSettings()
 {
-  long newPosition = M5Dial.Encoder.read();
+  long newPosition = readEncoder();
   long diff = newPosition - lastEncoderPosition;
   static long encoderAccumulator = 0;
 
@@ -1221,9 +1684,11 @@ void handleEncoderInSettings()
       drawSettingsMenu();
       break;
     case MENU_DEFAULT_SIDE:
-      // Only changes which side is selected at boot — not the live side
+      // The side is a preference: switch it live and remember it
       defaultRightSide = !defaultRightSide;
       preferences.putBool("rightSide", defaultRightSide);
+      activeSide = defaultRightSide ? SIDE_RIGHT : SIDE_LEFT;
+      offDetentAccum = 0;
       drawSettingsMenu();
       break;
     default: break;
@@ -1247,7 +1712,7 @@ void startIPEditor()
 {
   currentSubMenu = SUBMENU_IP_EDITOR;
   ipEditorOctet = 0;
-  lastEncoderPosition = M5Dial.Encoder.read();
+  lastEncoderPosition = readEncoder();
 
   for (int i = 0; i < 4; i++)
     tempIPOctets[i] = podIP[i];
@@ -1314,7 +1779,7 @@ void drawIPEditor()
 
 void handleEncoderInIPEditor()
 {
-  long newPosition = M5Dial.Encoder.read();
+  long newPosition = readEncoder();
   long diff = newPosition - lastEncoderPosition;
   static long encoderAccumulator = 0;
 
@@ -1347,7 +1812,7 @@ void handleEncoderInIPEditor()
     {
       saveIPFromEditor();
       currentSubMenu = SUBMENU_NONE;
-      lastEncoderPosition = M5Dial.Encoder.read();
+      lastEncoderPosition = readEncoder();
       drawSettingsMenu();
     }
     else
@@ -1364,7 +1829,7 @@ void startWiFiScanner()
   currentSubMenu = SUBMENU_WIFI_SCAN;
   scannedSSIDCount = 0;
   selectedSSIDIndex = 0;
-  lastEncoderPosition = M5Dial.Encoder.read();
+  lastEncoderPosition = readEncoder();
 
   // scanNetworks blocks for several seconds — show feedback first
   drawBusyScreen("Scanning...");
@@ -1452,7 +1917,7 @@ void drawWiFiScanner()
 
 void handleEncoderInWiFiScanner()
 {
-  long newPosition = M5Dial.Encoder.read();
+  long newPosition = readEncoder();
   long diff = newPosition - lastEncoderPosition;
   static long encoderAccumulator = 0;
 
@@ -1500,7 +1965,7 @@ void startPasswordEntry()
   // Start true so the release of the click that opened this screen
   // doesn't append a character; resets on the next press
   pwLongPressFired = true;
-  lastEncoderPosition = M5Dial.Encoder.read();
+  lastEncoderPosition = readEncoder();
   drawPasswordEntry();
 }
 
@@ -1591,7 +2056,7 @@ void drawPasswordEntry()
 
 void handleEncoderInPasswordEntry()
 {
-  long newPosition = M5Dial.Encoder.read();
+  long newPosition = readEncoder();
   long diff = newPosition - lastEncoderPosition;
   static long encoderAccumulator = 0;
 
@@ -1694,7 +2159,7 @@ void handleEncoderInPasswordEntry()
     }
 
     currentSubMenu = SUBMENU_NONE;
-    lastEncoderPosition = M5Dial.Encoder.read();
+    lastEncoderPosition = readEncoder();
     drawSettingsMenu();
     return;
   }
@@ -1717,61 +2182,130 @@ void handleEncoderInPasswordEntry()
   }
 }
 
-// ==================== Color & Utility ====================
 
-uint16_t getTemperatureColor(float percent)
+// ==================== Serial Debug ====================
+
+// Single-character commands over USB serial so the UI can be exercised and
+// inspected without touching the device:
+//   + / -  one detent up / down     c  click (switch side)  o  toggle power   P  ensure on
+//   n      cycle night override     z  force dim now        w  wake
+//   p      dump the framebuffer (run-length encoded RGB565 hex)
+//   h / l  fake the mattress 9°F below / above the setpoint (heating / cooling)
+//   a      fake the mattress at the setpoint    H  start a simulated hold (ring fills)
+//   T / t  freeze / unfreeze the UI clock; frozen, each p advances one 25fps frame and dumps
+//   S / x  open / close the settings menu       f  frame timing
+void handleSerialDebug()
 {
-  // 3-segment gradient: Cool Blue -> Teal -> Warm Amber -> Red-Orange
-  if (percent < 0.0f) percent = 0.0f;
-  if (percent > 1.0f) percent = 1.0f;
-
-  uint8_t r, g, b;
-
-  if (percent < 0.333f)
+  while (Serial.available())
   {
-    float t = percent / 0.333f;
-    r = 0;
-    g = (uint8_t)(120 + 60 * t);
-    b = (uint8_t)(220 - 80 * t);
+    char c = Serial.read();
+    switch (c)
+    {
+    case '+': simulatedEncoderDelta += 1; break;
+    case '-': simulatedEncoderDelta -= 1; break;
+    case 'c': if (!inSettingsMenu) { recordActivity(); cycleSide(+1); } break;
+    case 'o': if (!inSettingsMenu) { recordActivity(); setActivePower(!isActivePowerOn()); } break;
+    case 'P': if (!inSettingsMenu && !isActivePowerOn()) { recordActivity(); setActivePower(true); } break;
+    case 'n':
+      nightOverride = (NightOverride)(((int)nightOverride + 1) % 3);
+      Serial.printf("night override -> %d\n", (int)nightOverride);
+      drawTemperatureUI();
+      break;
+    case 'z': lastActivityTime = uiMillis() - DIM_TIMEOUT_MS - 1; break;
+    case 'w': recordActivity(); debugHoldStart = 0; drawTemperatureUI(); break;
+    case 'h': case 'l': case 'a':
+    {
+      // Local only; the 30s sync hold-off keeps the Pod from correcting it at once
+      int &cur = (activeSide == SIDE_RIGHT) ? rightCurrentTempF : leftCurrentTempF;
+      int off = (c == 'h') ? -9 : (c == 'l' ? 9 : 0);
+      cur = getDisplaySetpoint() + off;
+      lastActivityTime = uiMillis();
+      drawTemperatureUI();
+      break;
+    }
+    case 'H': debugHoldStart = uiMillis(); recordActivity(); drawTemperatureUI(); break;
+    case 'S': if (!inSettingsMenu) { recordActivity(); openSettings(); } break;
+    case 'x': if (inSettingsMenu) { inSettingsMenu = false; currentSubMenu = SUBMENU_NONE; lastEncoderPosition = readEncoder(); drawTemperatureUI(); } break;
+    case 'p':
+      if (demoFrozen) { demoNow += 40; uiDirty = true; dumpAfterFrame = true; }
+      else dumpScreen();
+      break;
+    case 'T': case 't':
+      demoFrozen = (c == 'T');
+      if (demoFrozen) demoNow = millis();
+      Serial.printf("demo clock %s\n", demoFrozen ? "frozen" : "live");
+      break;
+    case 'f':
+      Serial.printf("frame last=%luus max=%luus n=%lu heap=%u arc=%lu marker=%lu text=%lu push=%lu\n",
+                    (unsigned long)frameUsLast, (unsigned long)frameUsMax,
+                    (unsigned long)frameCount, ESP.getFreeHeap(),
+                    (unsigned long)sectUs[0], (unsigned long)sectUs[1],
+                    (unsigned long)sectUs[2], (unsigned long)sectUs[3]);
+      frameUsMax = 0;
+      break;
+    default: break;
+    }
   }
-  else if (percent < 0.666f)
-  {
-    float t = (percent - 0.333f) / 0.333f;
-    r = (uint8_t)(235 * t);
-    g = (uint8_t)(180 - 40 * t);
-    b = (uint8_t)(140 - 130 * t);
-  }
-  else
-  {
-    float t = (percent - 0.666f) / 0.334f;
-    r = (uint8_t)(235 + 20 * t);
-    g = (uint8_t)(140 - 100 * t);
-    b = (uint8_t)(10 - 10 * t);
-  }
-
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
 }
 
-uint16_t getTemperatureColorNight(float percent)
+// Framebuffer dump: run-length encoded RGB565 as hex "ccvvvv" pairs (cc =
+// run length 1..255, vvvv = pixel as stored). The screen is mostly
+// background, so this is ~10x less serial traffic than raw pixels, which
+// matters because the USB-CDC driver wedges under sustained full-speed output.
+void dumpScreen()
 {
-  if (percent < 0.0f) percent = 0.0f;
-  if (percent > 1.0f) percent = 1.0f;
-
-  uint8_t r = (uint8_t)(64 + 191 * percent);
-  return ((r & 0xF8) << 8); // Red only
+  const uint16_t *buf = (const uint16_t *)sprite.getBuffer();
+  static const char hex[] = "0123456789abcdef";
+  char line[6 * 64 + 1];
+  int col = 0;
+  const int total = SCREEN_WIDTH * SCREEN_HEIGHT;
+  xSemaphoreTake(serialMutex, portMAX_DELAY);
+  Serial.println("<<FB>>");
+  int i = 0;
+  while (i < total)
+  {
+    uint16_t v = buf[i];
+    int run = 1;
+    while (i + run < total && run < 255 && buf[i + run] == v) run++;
+    line[col++] = hex[(run >> 4) & 0xF];
+    line[col++] = hex[run & 0xF];
+    line[col++] = hex[(v >> 12) & 0xF];
+    line[col++] = hex[(v >> 8) & 0xF];
+    line[col++] = hex[(v >> 4) & 0xF];
+    line[col++] = hex[v & 0xF];
+    i += run;
+    if (col >= 6 * 64)
+    {
+      line[col] = 0;
+      Serial.println(line);
+      col = 0;
+      delay(1); // let the USB driver drain between lines
+    }
+  }
+  if (col)
+  {
+    line[col] = 0;
+    Serial.println(line);
+  }
+  Serial.println("<<END>>");
+  xSemaphoreGive(serialMutex);
 }
+
+// ==================== Utility ====================
 
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max)
 {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-// Short confirmation beep for actions with no other immediate feedback
-// (power toggle, setpoint reset). Silent at night.
+// One short, quiet tick for actions with no other immediate feedback (side
+// change, off/on stop, settings opening). Rotation is always silent: the
+// detents are the feedback. Fully silent at night — a partner 40cm away
+// must never hear the device. Errors are never audible; they show on screen.
 void feedbackBeep(uint16_t freq)
 {
   if (isNightTime()) return;
-  M5Dial.Speaker.tone(freq, 40);
+  M5Dial.Speaker.tone(freq, 10);
 }
 
 // Full-screen message for blocking operations (WiFi scan, mDNS discovery)
@@ -1792,6 +2326,7 @@ String fitText(const String &s, unsigned int maxChars)
   if (s.length() <= maxChars) return s;
   return s.substring(0, maxChars - 2) + "..";
 }
+
 
 // ==================== Time & Brightness ====================
 
@@ -1833,27 +2368,38 @@ bool isNightTime()
     return (hour >= NIGHT_START_HOUR && hour < NIGHT_END_HOUR);
 }
 
+
+
 void recordActivity()
 {
-  lastActivityTime = millis();
+  lastActivityTime = uiMillis();
   if (isDimmed)
   {
     isDimmed = false;
+    drawTemperatureUI();
     updateBrightness();
   }
 }
 
+// Backlight: dim after DIM_TIMEOUT (shorter at night) and fade between
+// levels instead of stepping. The fade runs in perceptual (sqrt) space so
+// the low end doesn't collapse in the first few milliseconds.
 void updateBrightness()
 {
-  unsigned long timeSinceActivity = millis() - lastActivityTime;
+  unsigned long now = uiMillis();
+  unsigned long timeSinceActivity = now - lastActivityTime;
+  unsigned long dimTimeout = isNightTime() ? DIM_TIMEOUT_NIGHT_MS : DIM_TIMEOUT_MS;
   uint8_t targetBrightness;
 
-  if (timeSinceActivity > DIM_TIMEOUT_MS)
+  if (!inSettingsMenu && timeSinceActivity > dimTimeout)
   {
     targetBrightness = BRIGHTNESS_DIM;
     if (!isDimmed)
     {
       isDimmed = true;
+      dimmedAt = now;
+      holdActive = false;
+      drawTemperatureUI();
     }
   }
   else
@@ -1862,19 +2408,37 @@ void updateBrightness()
     isDimmed = false;
   }
 
-  M5Dial.Display.setBrightness(targetBrightness);
+  if ((float)targetBrightness != brightnessTarget)
+  {
+    unsigned long dur = targetBrightness > brightnessNow ? WAKE_FADE_MS : SLEEP_FADE_MS;
+    brightnessTarget = (float)targetBrightness;
+    tweenStart(brightnessTween, sqrtf(brightnessNow), sqrtf(brightnessTarget), dur, now);
+  }
+
+  float s = tweenValue(brightnessTween, now);
+  float v = s * s;
+  if ((int)v != (int)brightnessNow)
+  {
+    M5Dial.Display.setBrightness((uint8_t)v);
+  }
+  brightnessNow = v;
 }
 
 // ==================== State Helpers ====================
 
 int &getActiveSetpoint()
 {
-  return rightSideActive ? rightSetpoint : leftSetpoint;
+  return activeSide == SIDE_RIGHT ? rightSetpoint : leftSetpoint;
 }
 
-int &getInactiveSetpoint()
+int getDisplaySetpoint()
 {
-  return rightSideActive ? leftSetpoint : rightSetpoint;
+  return getActiveSetpoint();
+}
+
+bool isActivePowerOn()
+{
+  return activeSide == SIDE_RIGHT ? rightPowerOn : leftPowerOn;
 }
 
 String getMenuItemName(MenuItem item)
@@ -1886,7 +2450,7 @@ String getMenuItemName(MenuItem item)
   case MENU_MDNS_DISCOVER:  return "Discover Pod";
   case MENU_TEMP_UNIT:      return "Temperature Unit";
   case MENU_NIGHT_MODE:     return "Night Mode";
-  case MENU_DEFAULT_SIDE:   return "Default Side";
+  case MENU_DEFAULT_SIDE:   return "Side";
   default:                  return "Unknown";
   }
 }
@@ -1904,27 +2468,78 @@ bool notePodRequestResult(bool ok)
   return ok || podSyncFailures < 2;
 }
 
-void toggleActivePower()
+// Snapshot whatever changed since the last flush and hand it to the HTTP
+// worker. Local state stays as the user set it; the arc cap stays hollow
+// until the worker reports back.
+void flushPendingApi()
 {
-  const char *side = rightSideActive ? "right" : "left";
-  bool &power = rightSideActive ? rightPowerOn : leftPowerOn;
+  pendingApiUpdate = false;
+  httpFlushJob.temp[0] = pendingTemp[0];
+  httpFlushJob.temp[1] = pendingTemp[1];
+  httpFlushJob.power[0] = pendingPower[0];
+  httpFlushJob.power[1] = pendingPower[1];
+  httpFlushJob.setpoint[0] = leftSetpoint;
+  httpFlushJob.setpoint[1] = rightSetpoint;
+  httpFlushJob.powerOn[0] = leftPowerOn;
+  httpFlushJob.powerOn[1] = rightPowerOn;
+  pendingTemp[0] = pendingTemp[1] = false;
+  pendingPower[0] = pendingPower[1] = false;
 
-  // Only flip local state (and give success feedback) once the Pod
-  // confirms, so the display never shows a state the Pod didn't accept
-  bool ok = setPodPower(podIP, side, !power, podPort);
-  if (ok)
-  {
-    power = !power;
-    feedbackBeep(power ? 3000 : 2000);
-  }
-  else
-  {
-    feedbackBeep(1000); // Low error tone: toggle didn't go through
-  }
-  podReachable = notePodRequestResult(ok);
-
-  drawTemperatureUI();
+  httpBusy = true;
+  uint8_t kind = HTTP_JOB_FLUSH;
+  xQueueSend(httpQueue, &kind, 0);
 }
+
+// Worker: power first (so a setpoint lands on a side that is on), then
+// temperature, per side. Never touches the display or UI state.
+void httpTask(void *)
+{
+  const char *names[2] = {"left", "right"};
+  for (;;)
+  {
+    uint8_t kind = 0;
+    if (xQueueReceive(httpQueue, &kind, portMAX_DELAY) != pdTRUE) continue;
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+
+    if (kind == HTTP_JOB_FLUSH)
+    {
+      bool ok = true;
+      for (int i = 0; i < 2; i++)
+      {
+        if (httpFlushJob.power[i])
+          ok = setPodPower(podIP, names[i], httpFlushJob.powerOn[i], podPort) && ok;
+        if (httpFlushJob.temp[i])
+          ok = setPodTemperature(podIP, names[i], httpFlushJob.setpoint[i], podPort) && ok;
+      }
+      httpFlushOk = ok;
+      httpFlushDone = true;
+    }
+    else if (kind == HTTP_JOB_SYNC)
+    {
+      httpSyncResult = fetchPodStatus(podIP, podPort);
+      httpSyncDone = true;
+    }
+    xSemaphoreGive(serialMutex);
+    httpBusy = false;
+  }
+}
+
+// Main loop side: fold worker results back into UI state
+void consumeHttpResults()
+{
+  if (httpFlushDone)
+  {
+    httpFlushDone = false;
+    podReachable = notePodRequestResult(httpFlushOk);
+    drawTemperatureUI(); // cap turns solid, or "Pod offline" appears
+  }
+  if (httpSyncDone)
+  {
+    httpSyncDone = false;
+    applyPodStatus(httpSyncResult);
+  }
+}
+
 
 void syncStatusFromPod()
 {
@@ -1937,14 +2552,16 @@ void syncStatusFromPod()
   {
     if (status.left.valid)
     {
-      leftSetpoint = status.left.targetTemperatureF;
+      if (status.left.targetTemperatureF >= TEMP_MIN_F && status.left.targetTemperatureF <= TEMP_MAX_F)
+        leftSetpoint = status.left.targetTemperatureF;
       leftCurrentTempF = status.left.currentTemperatureF;
       leftPowerOn = status.left.isPowered;
       Serial.printf("Left synced: target=%d°F actual=%d°F %s\n", leftSetpoint, leftCurrentTempF, leftPowerOn ? "ON" : "OFF");
     }
     if (status.right.valid)
     {
-      rightSetpoint = status.right.targetTemperatureF;
+      if (status.right.targetTemperatureF >= TEMP_MIN_F && status.right.targetTemperatureF <= TEMP_MAX_F)
+        rightSetpoint = status.right.targetTemperatureF;
       rightCurrentTempF = status.right.currentTemperatureF;
       rightPowerOn = status.right.isPowered;
       Serial.printf("Right synced: target=%d°F actual=%d°F %s\n", rightSetpoint, rightCurrentTempF, rightPowerOn ? "ON" : "OFF");
@@ -1988,9 +2605,17 @@ void syncStatusFromPod()
   }
 }
 
+
+
 void syncFromPod()
 {
-  PodStatus status = fetchPodStatus(podIP, podPort);
+  httpBusy = true;
+  uint8_t kind = HTTP_JOB_SYNC;
+  xQueueSend(httpQueue, &kind, 0);
+}
+
+void applyPodStatus(const PodStatus &status)
+{
   bool needsRedraw = false;
 
   bool reachable = notePodRequestResult(status.success);
@@ -2004,39 +2629,20 @@ void syncFromPod()
   {
     if (status.left.valid)
     {
-      if (leftPowerOn != status.left.isPowered)
-      {
-        leftPowerOn = status.left.isPowered;
-        needsRedraw = true;
-      }
-      if (leftSetpoint != status.left.targetTemperatureF)
-      {
-        leftSetpoint = status.left.targetTemperatureF;
-        needsRedraw = true;
-      }
-      if (leftCurrentTempF != status.left.currentTemperatureF)
-      {
-        leftCurrentTempF = status.left.currentTemperatureF;
-        needsRedraw = true;
-      }
+      if (leftPowerOn != status.left.isPowered) { leftPowerOn = status.left.isPowered; needsRedraw = true; }
+      // The Pod reports target 0 for a side that is off; keep the last real setpoint
+      if (leftSetpoint != status.left.targetTemperatureF &&
+          status.left.targetTemperatureF >= TEMP_MIN_F && status.left.targetTemperatureF <= TEMP_MAX_F)
+      { leftSetpoint = status.left.targetTemperatureF; needsRedraw = true; }
+      if (leftCurrentTempF != status.left.currentTemperatureF) { leftCurrentTempF = status.left.currentTemperatureF; needsRedraw = true; }
     }
     if (status.right.valid)
     {
-      if (rightPowerOn != status.right.isPowered)
-      {
-        rightPowerOn = status.right.isPowered;
-        needsRedraw = true;
-      }
-      if (rightSetpoint != status.right.targetTemperatureF)
-      {
-        rightSetpoint = status.right.targetTemperatureF;
-        needsRedraw = true;
-      }
-      if (rightCurrentTempF != status.right.currentTemperatureF)
-      {
-        rightCurrentTempF = status.right.currentTemperatureF;
-        needsRedraw = true;
-      }
+      if (rightPowerOn != status.right.isPowered) { rightPowerOn = status.right.isPowered; needsRedraw = true; }
+      if (rightSetpoint != status.right.targetTemperatureF &&
+          status.right.targetTemperatureF >= TEMP_MIN_F && status.right.targetTemperatureF <= TEMP_MAX_F)
+      { rightSetpoint = status.right.targetTemperatureF; needsRedraw = true; }
+      if (rightCurrentTempF != status.right.currentTemperatureF) { rightCurrentTempF = status.right.currentTemperatureF; needsRedraw = true; }
     }
   }
 

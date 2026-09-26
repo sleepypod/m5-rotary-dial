@@ -1,62 +1,88 @@
-# Sleepypod MT Rotary Dial
+<p align="center">
+  <img src="docs/screens/banner.png" alt="sleepypod Dial: heating, night theme, and the dimmed glance state" width="900">
+</p>
 
-[![codecov](https://codecov.io/gh/sleepypod/m5-rotary-dial/branch/main/graph/badge.svg)](https://codecov.io/gh/sleepypod/m5-rotary-dial)
+<h1 align="center">sleepypod Dial</h1>
 
-An M5Stack Dial (ESP32-S3) temperature controller for [sleepypod-core](https://github.com/throwaway31265/free-sleep), providing a physical rotary interface to control your Eight Sleep Pod's left and right side temperatures.
+<p align="center"><strong>One arc. One number. Nothing to learn in the dark.</strong></p>
 
-Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial) — the original FreeSleep rotary dial controller. This project adapts the concept to use sleepypod-core's tRPC/REST APIs, mDNS auto-discovery, and side-name personalization.
+<p align="center">
+A bedside knob for the Eight Sleep Pod, built on the <a href="https://shop.m5stack.com/products/m5stack-dial-esp32-s3-smart-rotary-knob-w-1-28-round-touch-screen">M5Stack Dial</a> and talking to <a href="https://github.com/throwaway31265/free-sleep">sleepypod-core</a> on your own network.<br>
+It shows where your mattress is, where it is going, and lets you turn it, click it off, and leave it alone.
+</p>
 
-## How It Works
+<p align="center">
+  <a href="https://codecov.io/gh/sleepypod/m5-rotary-dial"><img src="https://codecov.io/gh/sleepypod/m5-rotary-dial/branch/main/graph/badge.svg" alt="codecov"></a>
+</p>
 
-```mermaid
-graph LR
-    Dial["M5Stack Dial"] -- "REST API" --> Pod["sleepypod-core<br/>(on Pod)"]
-    Pod -- "DAC Socket" --> HW["Pod Hardware<br/>(heating/cooling)"]
-    Dial -. "mDNS Discovery" .-> Pod
-    HA["Home Automation"] -- "Local API :80" --> Dial
-```
+> Every image on this page is a frame captured from the device, not a mockup. `tools/walkthrough.py` regenerates all of them.
 
-The dial communicates with sleepypod-core over your local network — no cloud, no internet required. It discovers the Pod automatically via mDNS (`_sleepypod._tcp`) or uses a manually configured IP.
+## In motion
 
-## Features
+<table>
+<tr>
+<td align="center"><img src="docs/video/turn.gif" width="200" alt="Turning"><br><strong>Turning</strong><br><sub>1° per detent, 2° when you spin. The arc settles 180 ms after you stop.</sub></td>
+<td align="center"><img src="docs/video/loader.gif" width="200" alt="Getting there"><br><strong>Getting there</strong><br><sub>Solid fill is the mattress. The dim span to the target carries a highlight that travels toward it.</sub></td>
+<td align="center"><img src="docs/video/power.gif" width="200" alt="Off and on"><br><strong>Off and on</strong><br><sub>One click empties the arc. One more brings it back at the last setpoint.</sub></td>
+<td align="center"><img src="docs/video/settings.gif" width="200" alt="Holding"><br><strong>Holding</strong><br><sub>The ring fills over 1.5 s, then settings opens. Let go early and nothing happens.</sub></td>
+</tr>
+</table>
 
-### Temperature Control
-- **Dual Side Control**: Independent temperature setpoints for left and right sides of the bed
-- **Rotary Dial Interface**: 1°F per detent, smooth and responsive
-- **Touch Arc Control**: Tap anywhere on the arc to jump to that temperature
-- **Temperature Range**: 55°F to 110°F (matching Pod hardware limits)
-- **Visual Temperature Arc**: Color gradient from blue (cool) through teal/amber to red (hot)
-- **Setpoint Indicators**: Active side shown with radial line, inactive side with subtle tick
+## Nine screens, in the order you meet them
 
-### sleepypod-core Integration
-- **mDNS Auto-Discovery**: Finds your Pod on the network automatically
-- **Personalized Side Names**: Fetches side names from sleepypod-core settings
-- **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
-- **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
-- **Power Control**: Short tap to toggle side on/off, with audible confirmation (beep is silent at night)
-- **Connection Status**: "WiFi offline" / "Pod offline" indicator on the main screen when degraded
-- **Auto-Reconnect**: Recovers WiFi automatically after router restarts
-- **Auto-Restart**: Configurable daily restart for reliability
+<table>
+<tr>
+<td align="center"><img src="docs/screens/heating.png" width="200" alt="Heating"><br><strong>Turn toward comfort</strong><br><sub>Solid fill is where the mattress is. The span beyond it leads to the number you chose and shrinks as the bed catches up.</sub></td>
+<td align="center"><img src="docs/screens/cooling.png" width="200" alt="Cooling"><br><strong>Same timeline, either direction</strong><br><sub>Cooling reads the same way: the target sits at the cap, the span is the distance still to travel.</sub></td>
+<td align="center"><img src="docs/screens/at-target.png" width="200" alt="At target"><br><strong>Then it goes quiet</strong><br><sub>At the target the loader disappears. Just your side, your number, the time.</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screens/off.png" width="200" alt="Off"><br><strong>Off is a click</strong><br><sub>Click the dial, or tap the power glyph. The arc empties and the number dims.</sub></td>
+<td align="center"><img src="docs/screens/hold-ring.png" width="200" alt="Hold ring"><br><strong>Hold for settings</strong><br><sub>Hold the dial or the screen. A ring fills around the rim; release early to cancel.</sub></td>
+<td align="center"><img src="docs/screens/settings.png" width="200" alt="Settings"><br><strong>Your side is a preference</strong><br><sub>Pick Left or Right once in Settings. Nothing on the main screen switches it by accident.</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/screens/night.png" width="200" alt="Night"><br><strong>Red after ten</strong><br><sub>Between 10 pm and 7 am everything shifts to red on black at 20% brightness. No sounds at all.</sub></td>
+<td align="center"><img src="docs/screens/night-dim.png" width="200" alt="Night dim"><br><strong>Glanceable at 3 am</strong><br><sub>After five seconds it dims to 1%. Only the number and one status dot survive, by design.</sub></td>
+<td align="center"><img src="docs/screens/day-dim.png" width="200" alt="Day dim"><br><strong>Wake without changing anything</strong><br><sub>The first touch after a dim only wakes the screen. A bump in the dark never moves your temperature.</sub></td>
+</tr>
+</table>
 
-### Automatic Night Mode
-- **Automatic Activation**: Red-only theme between 10pm and 7am (configurable)
-- **Reduced Brightness**: 20% during night hours
-- **Manual Override**: Medium press (400-1000ms) on center forces the opposite mode; Settings offers Auto / Forced On / Forced Off
+## Five things, and only five
 
-### Smart Display
-- **Auto Dimming**: ~1% brightness after 10 seconds of inactivity
-- **Safe Wake**: The first touch or rotation while dimmed only wakes the screen — it never changes anything
-- **Double Buffering**: Flicker-free rendering via LGFX_Sprite
+| You do | It does |
+|---|---|
+| **Turn** | Moves the target. 1° per detent, 2° when you spin. Two detents below 55° reach an off stop. |
+| **Click**, or tap ⏻ | Turns your side off, or back on at the last setpoint. |
+| **Hold**, or tap ⚙ | Opens settings after a ring fills. Release early and nothing happens. |
+| **Settings › Side** | Picks Left or Right once. It is remembered and never changes by accident. |
+| **Touch while dim** | Only wakes the screen. The next turn counts. |
 
-### Local REST API
-The dial exposes its own API on port 80 for home automation:
+Nothing on the main screen changes a value by touch. Rotation is always silent (the detents are the feedback); a side change or power toggle gets one 10 ms tick by day and nothing at night.
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | HTML dashboard |
-| `/api/temperature` | GET/POST | Current setpoint, set temperature |
-| `/api/status` | GET | Full device status |
-| `/api/config/pod-ip` | GET/POST | Pod IP configuration |
+## By the numbers
+
+| | |
+|---|---|
+| **55–110 °F** | the Pod's range, 1° per detent |
+| **2°** | per detent when you spin, never more |
+| **1.5 s** | hold for settings, ring shows progress |
+| **0 dB** | after 10 pm, no sounds at all |
+| **19 ms** | per frame; the encoder is polled every 1 ms so a spin never drops detents |
+| **500 ms** | after the last detent before a change is sent, from a worker task that never blocks the dial |
+
+## What it does for you
+
+- **Local only.** Talks to sleepypod-core on your network. Finds the Pod by mDNS (`_sleepypod._tcp`) or uses an IP you set. No cloud, no account.
+- **Honest about the network.** A hollow cap means the Pod has not confirmed a change yet. "Pod offline" and "No Wi-Fi" say so in words, and the dial reconnects on its own after a router restart.
+- **Your name on it.** The side name comes from the Pod's settings, so the dial says Jon, not L.
+- **Your changes win.** The Pod's own state never overwrites a number you touched in the last 30 seconds.
+- **Night mode that stays out of the way.** Red-only theme 10 pm to 7 am at 20% brightness, dims to 1% after five seconds, fades instead of stepping. Override it in Settings.
+- **Reliable.** Daily restart follows the Pod's own reboot schedule, and a watchdog reboots the dial if the UI loop ever stalls.
+
+Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial). For the full feature reference, API integration, and the detailed controls table see [`docs/features.md`](docs/features.md); for boot, loop, rendering and state diagrams see [`docs/architecture.md`](docs/architecture.md). There is also a self-contained walkthrough page at [`docs/walkthrough.html`](docs/walkthrough.html).
+
+---
 
 ## Hardware Requirements
 
@@ -127,38 +153,7 @@ To manually set the Pod IP:
 
 ## Usage
 
-### Main Screen
-
-```
-        ┌─────────────────┐
-       ╱   Temperature    ╲
-      │     Arc (210°)      │
-      │                     │
-      │      ┌─────┐       │
-      │      │ 75°F│       │
-      │      └─────┘       │
-      │                     │
-      │   [L]         [R]   │
-       ╲      12:34      ╱
-        └─────────────────┘
-```
-
-When the dial can't reach WiFi or the Pod, a "WiFi offline" / "Pod offline" indicator appears above the clock — setpoint changes made while offline are re-synced from the Pod, so check the indicator if the dial seems unresponsive.
-
-### Controls
-
-| Action | Result |
-|--------|--------|
-| **Rotate dial** | Adjust temperature (1°F per click) |
-| **Double-press dial** | Reset to default (75°F) |
-| **Tap temperature arc** | Jump to that temperature |
-| **Short tap center** (<400ms) | Toggle power ON/OFF (confirmation beep is silent at night) |
-| **Double-tap center** | Reset to default temperature |
-| **Medium hold center** (400ms-1s) | Force day/night mode (opposite of current) |
-| **Long hold center** (>1s) | Open settings menu |
-| **Tap L button** | Switch to left side |
-| **Tap R button** | Switch to right side |
-| **Tap bottom area** | Open settings menu |
+Controls are summarised above. The settings menu (hold the dial or screen, or tap the gear) offers:
 
 ### Settings Menu
 
@@ -169,7 +164,7 @@ When the dial can't reach WiFi or the Pod, a "WiFi offline" / "Pod offline" indi
 | **Discover Pod** | Re-run mDNS discovery |
 | **Temperature Unit** | Toggle °F / °C display (a local choice sticks — Pod sync won't revert it) |
 | **Night Mode** | Cycle Auto / Forced On / Forced Off |
-| **Default Side** | Side selected at boot (doesn't switch the live side) |
+| **Side** | Which side this dial controls (switches immediately, remembered) |
 
 ## Architecture
 
