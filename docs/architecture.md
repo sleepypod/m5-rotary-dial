@@ -141,14 +141,18 @@ flowchart LR
     end
 
     subgraph "UI Layers"
-        Arc["Temperature Arc<br/>165°-375° gradient"] --> Sprite
-        Center["Temperature Value<br/>+ Unit indicator"] --> Sprite
-        Buttons["L/R Side Buttons"] --> Sprite
-        Clock["Clock (partial update)"] --> LCD
+        Arc["Setpoint arc<br/>135°-405° gradient, hollow cap while unconfirmed"] --> Sprite
+        Marker["Current-temp dot + distance arc<br/>(breathes while converging)"] --> Sprite
+        Sides["Side pair + sliding underline"] --> Sprite
+        Center["Setpoint numeral + unit + status line"] --> Sprite
+        Clock["Clock / No Wi-Fi"] --> Sprite
+        Ring["Settings hold ring"] --> Sprite
     end
 ```
 
-All rendering uses double-buffering via LGFX_Sprite to eliminate flicker. The clock uses a dedicated mini-sprite for efficient per-second updates without full redraws.
+All rendering goes through one full-screen LGFX_Sprite. The loop only renders a frame when state changed, a tween is active (arc settle 180ms, side switch 220ms, hold ring), the marker is breathing (20fps), or the minute changed. Backlight changes fade in perceptual (sqrt) space. The dim state is a separate, minimal render: numeral plus one status dot.
+
+Serial debug (USB CDC, 115200): `+`/`-` simulate detents through the real encoder path, `c` click, `o` power, `n` night override, `z` dim, `w` wake, `p` dump the framebuffer as hex. `tools/dial_shot.py <out.png> [cmds...]` drives this and writes a PNG.
 
 ## State Management
 
@@ -156,7 +160,7 @@ All rendering uses double-buffering via LGFX_Sprite to eliminate flicker. The cl
 stateDiagram-v2
     [*] --> MainScreen: Boot complete
 
-    MainScreen --> SettingsMenu: Long press center\nor tap bottom area
+    MainScreen --> SettingsMenu: Hold dial or screen 1.5s\n(progress ring)
     SettingsMenu --> MainScreen: Tap screen
 
     SettingsMenu --> IPEditor: Select "Pod IP"
@@ -171,14 +175,14 @@ stateDiagram-v2
 
     state MainScreen {
         [*] --> LeftActive
-        LeftActive --> RightActive: Tap R button
-        RightActive --> LeftActive: Tap L button
+        LeftActive --> RightActive: Click / swipe
+        RightActive --> BothActive: Click / swipe
+        BothActive --> LeftActive: Click / swipe
 
-        LeftActive --> PowerOff_L: Short tap center
-        PowerOff_L --> LeftActive: Short tap center
-
-        RightActive --> PowerOff_R: Short tap center
-        PowerOff_R --> RightActive: Short tap center
+        LeftActive --> Off_L: 2 detents below 55°F
+        Off_L --> LeftActive: Any detent up
+        RightActive --> Off_R: 2 detents below 55°F
+        Off_R --> RightActive: Any detent up
     }
 ```
 

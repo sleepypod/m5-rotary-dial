@@ -21,32 +21,35 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 ## Features
 
 ### Temperature Control
-- **Dual Side Control**: Independent temperature setpoints for left and right sides of the bed
-- **Rotary Dial Interface**: 1°F per detent, smooth and responsive
-- **Touch Arc Control**: Tap anywhere on the arc to jump to that temperature
+- **Left / Right / Both**: Click the dial or swipe to cycle sides; "Both" moves the two setpoints together
+- **Rotary Dial Interface**: 1°F per detent, 2°F per detent when you spin it, never more
+- **OFF stop**: Two detents below 55°F turn the side off; any detent up turns it back on at its last setpoint
 - **Temperature Range**: 55°F to 110°F (matching Pod hardware limits)
-- **Visual Temperature Arc**: Color gradient from blue (cool) through teal/amber to red (hot)
-- **Setpoint Indicators**: Active side shown with radial line, inactive side with subtle tick
+- **Visual Temperature Arc**: 270° gradient from cold-water blue through a body-neutral white to red-orange
+- **Current-temperature marker**: A breathing dot and a shrinking "distance to go" arc show the mattress converging on the setpoint
 
 ### sleepypod-core Integration
 - **mDNS Auto-Discovery**: Finds your Pod on the network automatically
 - **Personalized Side Names**: Fetches side names from sleepypod-core settings
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
 - **Debounced Updates**: API calls batched (500ms) to prevent conflicts while adjusting
-- **Power Control**: Short tap to toggle side on/off, with audible confirmation (beep is silent at night)
-- **Connection Status**: "WiFi offline" / "Pod offline" indicator on the main screen when degraded
+- **Unconfirmed writes are visible**: The arc's end cap is hollow until the Pod acknowledges a change
+- **Local changes win**: Pod sync never overwrites a setpoint touched in the last 30 seconds
+- **Connection Status**: "No Wi-Fi" / "Pod offline" on the main screen when degraded
 - **Auto-Reconnect**: Recovers WiFi automatically after router restarts
 - **Auto-Restart**: Configurable daily restart for reliability
 
 ### Automatic Night Mode
 - **Automatic Activation**: Red-only theme between 10pm and 7am (configurable)
 - **Reduced Brightness**: 20% during night hours
-- **Manual Override**: Medium press (400-1000ms) on center forces the opposite mode; Settings offers Auto / Forced On / Forced Off
+- **Manual Override**: Settings offers Auto / Forced On / Forced Off
+- **Silent at night**: No sounds at all while the night theme is active; day-time feedback is a single 10ms tick
 
 ### Smart Display
-- **Auto Dimming**: ~1% brightness after 10 seconds of inactivity
-- **Safe Wake**: The first touch or rotation while dimmed only wakes the screen — it never changes anything
-- **Double Buffering**: Flicker-free rendering via LGFX_Sprite
+- **Auto Dimming**: ~1% brightness after 10 seconds of inactivity (5 seconds at night), with fades instead of steps
+- **Glanceable when dim**: Only the big numeral and one status dot survive at 1% backlight, by design
+- **Safe Wake**: Input more than 3 seconds after dimming only wakes the screen — it never changes anything
+- **Motion**: The arc settles after you stop turning, the side underline slides, nothing else animates
 
 ### Local REST API
 The dial exposes its own API on port 80 for home automation:
@@ -130,35 +133,38 @@ To manually set the Pod IP:
 ### Main Screen
 
 ```
-        ┌─────────────────┐
-       ╱   Temperature    ╲
-      │     Arc (210°)      │
-      │                     │
-      │      ┌─────┐       │
-      │      │ 75°F│       │
-      │      └─────┘       │
-      │                     │
-      │   [L]         [R]   │
-       ╲      12:34      ╱
-        └─────────────────┘
+        ┌───────────────────┐
+       ╱   Jon  ·  Heidi     ╲      ← side pair, underline marks the active side
+      │   ‾‾‾                 │
+      │        82 °F          │      ← setpoint (DejaVu 56)
+      │                       │
+      │     heating · 69      │      ← mattress temperature and direction
+       ╲                     ╱
+        ╲      12:26        ╱        ← clock sits in the arc's opening
+         └─────────────────┘
 ```
 
-When the dial can't reach WiFi or the Pod, a "WiFi offline" / "Pod offline" indicator appears above the clock — setpoint changes made while offline are re-synced from the Pod, so check the indicator if the dial seems unresponsive.
+The 270° arc opens at the bottom. Its fill is the setpoint; a small dot on
+an inner ring is the current mattress temperature, joined to the setpoint by
+a thin arc that shrinks as the bed converges. When Wi-Fi is down the clock
+is replaced by "No Wi-Fi" and the arc turns grey; when the Pod is
+unreachable the status line says "Pod offline" and the arc's end cap is
+drawn hollow, the same cue used while a change is still unacknowledged.
 
 ### Controls
 
+Nothing on the main screen changes a value by touch, and nothing depends on
+a hold duration except settings, which shows its progress ring.
+
 | Action | Result |
 |--------|--------|
-| **Rotate dial** | Adjust temperature (1°F per click) |
-| **Double-press dial** | Reset to default (75°F) |
-| **Tap temperature arc** | Jump to that temperature |
-| **Short tap center** (<400ms) | Toggle power ON/OFF (confirmation beep is silent at night) |
-| **Double-tap center** | Reset to default temperature |
-| **Medium hold center** (400ms-1s) | Force day/night mode (opposite of current) |
-| **Long hold center** (>1s) | Open settings menu |
-| **Tap L button** | Switch to left side |
-| **Tap R button** | Switch to right side |
-| **Tap bottom area** | Open settings menu |
+| **Rotate** | Adjust the active side's setpoint (1°F per detent; 2°F when spun) |
+| **Rotate 2 detents below 55°F** | Reach the OFF stop and turn the side off |
+| **Rotate up while off** | Turn the side back on at its last setpoint |
+| **Click the dial** | Cycle side: Left → Right → Both → Left |
+| **Swipe left / right** | Same as click, in either direction |
+| **Press and hold 1.5s** (dial or screen) | Open settings; a ring fills around the rim, release early to cancel |
+| **Any input while dimmed** | Wakes the screen only (after the 3-second safe-wake arming) |
 
 ### Settings Menu
 
