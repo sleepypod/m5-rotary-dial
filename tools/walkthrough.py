@@ -3,6 +3,8 @@
 #
 #   ~/.platformio/penv/bin/python tools/walkthrough.py            # everything
 #   ~/.platformio/penv/bin/python tools/walkthrough.py --no-video # stills + page only
+#   ~/.platformio/penv/bin/python tools/walkthrough.py --only settings  # re-record one clip
+#   ~/.platformio/penv/bin/python tools/walkthrough.py --page-only  # rebuild the page from docs/
 #
 # Needs pyserial (PlatformIO's Python has it) and ffmpeg on PATH for video.
 # Uses the firmware's serial debug channel (see handleSerialDebug in main.cpp).
@@ -19,6 +21,7 @@ PAGE = os.path.join(ROOT, "docs", "walkthrough.html")
 W = H = 240
 NO_VIDEO = "--no-video" in sys.argv
 ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None  # capture one clip, no page
+PAGE_ONLY = "--page-only" in sys.argv  # no device: build the page from files already in docs/
 
 
 
@@ -124,6 +127,7 @@ class Dial:
             return None
         tmp = tempfile.mkdtemp()
         n = 0
+        self.send("w", settle=0.3)  # awake; the frozen clock may have drifted past the dim timeout
         self.send("T", settle=0.2)  # freeze
         try:
             for cmds, frames in script:
@@ -152,9 +156,29 @@ def b64(kind, data):
     return f"data:{kind};base64," + base64.b64encode(data).decode()
 
 
+STILL_NAMES = ["heating", "cooling", "at-target", "off", "on", "hold-ring", "settings", "night", "night-dim", "day-dim"]
+CLIP_NAMES = ["turn", "loader", "power", "settings"]
+
+
+def read_or_none(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 def main():
     os.makedirs(SCREENS, exist_ok=True)
     os.makedirs(VIDEO, exist_ok=True)
+    if PAGE_ONLY:
+        stills = {k: read_or_none(os.path.join(SCREENS, k + ".png")) for k in STILL_NAMES}
+        clips = {k: read_or_none(os.path.join(VIDEO, k + ".mp4")) for k in CLIP_NAMES}
+        missing = [k for k, v in stills.items() if v is None]
+        if missing:
+            sys.exit(f"missing stills: {missing}; run without --page-only first")
+        write_page(stills, clips)
+        return
     d = Dial()
     d.send("wxa")  # awake, main screen, mattress at target
     if ONLY:
@@ -189,7 +213,10 @@ def main():
         "settings": d.clip("settings", [("", 5), ("H", 45), ("x", 15)]),
     }
     d.send("wa")
+    write_page(stills, clips)
 
+
+def write_page(stills, clips):
     slides = [
         ("heating", "Turn toward comfort", "Solid fill is where the mattress is. The span beyond it pulses toward the number you chose and shrinks as the bed catches up."),
         ("cooling", "Same timeline, either direction", "Cooling reads the same way: the target sits at the cap, the pulsing span is the distance still to travel."),
