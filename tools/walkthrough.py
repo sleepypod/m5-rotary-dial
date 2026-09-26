@@ -9,7 +9,7 @@
 # Needs pyserial (PlatformIO's Python has it) and ffmpeg on PATH for video.
 # Uses the firmware's serial debug channel (see handleSerialDebug in main.cpp).
 # Fake mattress temperatures (h/l/a) are local only; the Pod is never written.
-# Outputs: docs/screens/*.png, docs/video/*.mp4 + *.gif, docs/walkthrough.html
+# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/walkthrough.html
 import base64, os, shutil, struct, subprocess, sys, tempfile, time, zlib
 import serial
 
@@ -177,6 +177,7 @@ def main():
         missing = [k for k, v in stills.items() if v is None]
         if missing:
             sys.exit(f"missing stills: {missing}; run without --page-only first")
+        write_banner()
         write_page(stills, clips)
         return
     d = Dial()
@@ -213,7 +214,18 @@ def main():
         "settings": d.clip("settings", [("", 5), ("H", 45), ("x", 15)]),
     }
     d.send("wa")
+    write_banner()
     write_page(stills, clips)
+
+
+def write_banner():
+    """README hero: three screens side by side at 2x on the panel background."""
+    src = [os.path.join(SCREENS, n + ".png") for n in ("heating", "night", "night-dim")]
+    out = os.path.join(SCREENS, "banner.png")
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src[0], "-i", src[1], "-i", src[2],
+                    "-filter_complex", "[0]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[a];[1]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[b];"
+                    "[2]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[c];[a][b][c]hstack=3,pad=iw+60:ih+80:30:40:0x0B0E14", out], check=True)
+    print("banner", out)
 
 
 def write_page(stills, clips):
