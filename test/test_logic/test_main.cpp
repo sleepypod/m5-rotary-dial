@@ -346,6 +346,37 @@ static void test_status_power_flag_aliases()
   TEST_ASSERT_TRUE(d.left.isPowered);
 }
 
+static void test_status_legacy_right_power_flags()
+{
+  PodStatus a = parsePodStatus("{\"right\":{\"targetTemperatureF\":70,\"isOn\":false}}");
+  TEST_ASSERT_TRUE(a.right.valid);
+  TEST_ASSERT_FALSE(a.right.isPowered);
+  PodStatus b = parsePodStatus("{\"right\":{\"targetTemperatureF\":70,\"isOn\":true}}");
+  TEST_ASSERT_TRUE(b.right.isPowered);
+  // When both flags are present isPowered wins in either format
+  PodStatus c = parsePodStatus("{\"right\":{\"targetTemperatureF\":70,\"isPowered\":false,\"isOn\":true},"
+                               "\"leftSide\":{\"targetTemperature\":70,\"isPowered\":true,\"isOn\":false}}");
+  TEST_ASSERT_FALSE(c.right.isPowered);
+  TEST_ASSERT_TRUE(c.left.isPowered);
+  // A side present in both formats reads the REST one
+  PodStatus d = parsePodStatus("{\"rightSide\":{\"targetTemperature\":90},\"right\":{\"targetTemperatureF\":60}}");
+  TEST_ASSERT_EQUAL_INT(90, d.right.targetTemperatureF);
+}
+
+static void test_status_field_aliases_and_types()
+{
+  // Legacy accepts the REST field names as a fallback; a non-integer target is ignored
+  PodStatus a = parsePodStatus("{\"left\":{\"targetTemperature\":88,\"currentTemperature\":80}}");
+  TEST_ASSERT_EQUAL_INT(88, a.left.targetTemperatureF);
+  TEST_ASSERT_EQUAL_INT(80, a.left.currentTemperatureF);
+  PodStatus b = parsePodStatus("{\"leftSide\":{\"targetTemperature\":\"hot\",\"targetLevel\":\"x\",\"currentTemperature\":72.5}}");
+  TEST_ASSERT_EQUAL_INT(TEMP_DEFAULT_F, b.left.targetTemperatureF);
+  TEST_ASSERT_EQUAL_INT(TEMP_DEFAULT_F, b.left.currentTemperatureF); // 72.5 is not an int
+  // REST has no alias for currentTemperature
+  PodStatus c = parsePodStatus("{\"leftSide\":{\"targetTemperature\":80,\"currentTemperatureF\":70}}");
+  TEST_ASSERT_EQUAL_INT(80, c.left.currentTemperatureF);
+}
+
 static void test_status_missing_fields_use_defaults()
 {
   PodStatus s = parsePodStatus("{\"leftSide\":{}}");
@@ -386,6 +417,10 @@ static void test_status_malformed_json()
   TEST_ASSERT_NOT_NULL(err);
   TEST_ASSERT_FALSE(parsePodStatus(nullptr).success);
   TEST_ASSERT_FALSE(parsePodStatus("not json at all").success);
+  // A good payload leaves the error pointer null
+  err = "stale";
+  TEST_ASSERT_TRUE(parsePodStatus("{\"leftSide\":{}}", &err).success);
+  TEST_ASSERT_NULL(err);
 }
 
 static void test_off_side_target_zero_is_not_a_setpoint()
@@ -502,6 +537,14 @@ static void test_settings_malformed_json_keeps_defaults()
   TEST_ASSERT_EQUAL_STRING("F", s.temperatureUnit);
   TEST_ASSERT_FALSE(parsePodSettings("").success);
   TEST_ASSERT_FALSE(parsePodSettings(nullptr).success);
+  err = "stale";
+  TEST_ASSERT_TRUE(parsePodSettings("{}", &err).success);
+  TEST_ASSERT_NULL(err);
+  // rebootTime longer than HH:mm is cut to the buffer, still parseable
+  PodSettings t = parsePodSettings("{\"device\":{\"rebootTime\":\"04:30:00.000\",\"rebootDaily\":false}}");
+  TEST_ASSERT_EQUAL_INT(7, strlen(t.rebootTime));
+  TEST_ASSERT_EQUAL_INT(4, parseRebootHour(t.rebootTime, 3));
+  TEST_ASSERT_FALSE(t.rebootDaily);
 }
 
 static void test_parse_reboot_hour()
@@ -513,6 +556,113 @@ static void test_parse_reboot_hour()
   TEST_ASSERT_EQUAL_INT(9, parseRebootHour("", 9));
   TEST_ASSERT_EQUAL_INT(9, parseRebootHour(nullptr, 9));
   TEST_ASSERT_EQUAL_INT(0, parseRebootHour("ab:00", 9)); // non-numeric reads as 0, like String::toInt
+}
+
+// ==================== Tweens ====================
+
+static void test_tween_eases_between_endpoints()
+{
+  Tween t;
+  tweenStart(t, 0.0f, 100.0f, 200, 1000);
+  TEST_ASSERT_TRUE(t.active);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.0f, tweenValue(t, 1000));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 50.0f, tweenValue(t, 1100)); // symmetric ease: halfway at half time
+  float early = tweenValue(t, 1050), late = tweenValue(t, 1150);
+  TEST_ASSERT_TRUE(early > 0.0f && early < 25.0f); // slow start
+  TEST_ASSERT_TRUE(late > 75.0f && late < 100.0f); // slow finish
+  TEST_ASSERT_TRUE(t.active);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 100.0f, tweenValue(t, 1200)); // done at dur
+  TEST_ASSERT_FALSE(t.active);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 100.0f, tweenValue(t, 5000)); // stays at the end
+}
+
+static void test_tween_same_endpoints_is_inactive_and_zero_duration_is_clamped()
+{
+  Tween t;
+  tweenStart(t, 42.0f, 42.0f, 300, 0);
+  TEST_ASSERT_FALSE(t.active);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 42.0f, tweenValue(t, 10));
+  tweenStart(t, 0.0f, 1.0f, 0, 0);
+  TEST_ASSERT_EQUAL_UINT32(1, t.dur);
+  TEST_ASSERT_TRUE(t.active);
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, 1.0f, tweenValue(t, 1));
+  TEST_ASSERT_FALSE(t.active);
+}
+
+static void test_easing_curves()
+{
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, easeOutCubic(0.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.875f, easeOutCubic(0.5f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 1.0f, easeOutCubic(1.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, easeInOutCubic(0.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.032f, easeInOutCubic(0.2f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.5f, easeInOutCubic(0.5f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.968f, easeInOutCubic(0.8f));
+  TEST_ASSERT_FLOAT_WITHIN(0.0001f, 1.0f, easeInOutCubic(1.0f));
+}
+
+// ==================== Time & backlight ====================
+
+static void test_night_hour_window_wraps_midnight()
+{
+  // Default 22..7
+  TEST_ASSERT_TRUE(isNightHour(22, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_TRUE(isNightHour(23, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_TRUE(isNightHour(0, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_TRUE(isNightHour(6, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_FALSE(isNightHour(7, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_FALSE(isNightHour(12, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  TEST_ASSERT_FALSE(isNightHour(21, NIGHT_START_HOUR, NIGHT_END_HOUR));
+  // A window inside one day
+  TEST_ASSERT_FALSE(isNightHour(0, 1, 5));
+  TEST_ASSERT_TRUE(isNightHour(1, 1, 5));
+  TEST_ASSERT_TRUE(isNightHour(4, 1, 5));
+  TEST_ASSERT_FALSE(isNightHour(5, 1, 5));
+  TEST_ASSERT_FALSE(isNightHour(23, 1, 5));
+}
+
+static void test_should_dim_after_timeout_unless_in_settings()
+{
+  TEST_ASSERT_FALSE(shouldDim(false, DIM_TIMEOUT_MS, false));
+  TEST_ASSERT_TRUE(shouldDim(false, DIM_TIMEOUT_MS + 1, false));
+  TEST_ASSERT_FALSE(shouldDim(false, DIM_TIMEOUT_NIGHT_MS + 1, false)); // day keeps the longer timeout
+  TEST_ASSERT_TRUE(shouldDim(false, DIM_TIMEOUT_NIGHT_MS + 1, true));
+  TEST_ASSERT_FALSE(shouldDim(false, DIM_TIMEOUT_NIGHT_MS, true));
+  TEST_ASSERT_FALSE(shouldDim(true, DIM_TIMEOUT_MS * 10, false)); // never inside settings
+  TEST_ASSERT_FALSE(shouldDim(true, DIM_TIMEOUT_MS * 10, true));
+}
+
+static void test_safe_wake_arms_after_delay()
+{
+  TEST_ASSERT_FALSE(safeWakeArmed(1000, 1000));
+  TEST_ASSERT_FALSE(safeWakeArmed(1000 + SAFE_WAKE_ARM_MS - 1, 1000));
+  TEST_ASSERT_TRUE(safeWakeArmed(1000 + SAFE_WAKE_ARM_MS, 1000));
+  TEST_ASSERT_TRUE(safeWakeArmed(0, 0xFFFFFFFFul - SAFE_WAKE_ARM_MS + 1)); // survives millis() wrap
+}
+
+static void test_format_temp_in_both_units()
+{
+  char buf[16];
+  formatTemp(78, true, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("78", buf);
+  formatTemp(78, false, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("25.6", buf);
+  formatTemp(TEMP_MIN_F, false, buf, sizeof(buf));
+  TEST_ASSERT_EQUAL_STRING("12.8", buf);
+  formatTemp(110, true, buf, 3); // truncated to the buffer, always terminated
+  TEST_ASSERT_EQUAL_STRING("11", buf);
+}
+
+static void test_wrap_octet()
+{
+  TEST_ASSERT_EQUAL_UINT8(0, wrapOctet(0));
+  TEST_ASSERT_EQUAL_UINT8(255, wrapOctet(255));
+  TEST_ASSERT_EQUAL_UINT8(0, wrapOctet(256));
+  TEST_ASSERT_EQUAL_UINT8(1, wrapOctet(257));
+  TEST_ASSERT_EQUAL_UINT8(255, wrapOctet(-1));
+  TEST_ASSERT_EQUAL_UINT8(0, wrapOctet(-256));
+  TEST_ASSERT_EQUAL_UINT8(254, wrapOctet(-258));
+  TEST_ASSERT_EQUAL_UINT8(88, wrapOctet(88 + 512));
 }
 
 int main(int, char **)
@@ -552,6 +702,8 @@ int main(int, char **)
   RUN_TEST(test_status_rest_format_both_sides);
   RUN_TEST(test_status_legacy_format);
   RUN_TEST(test_status_power_flag_aliases);
+  RUN_TEST(test_status_legacy_right_power_flags);
+  RUN_TEST(test_status_field_aliases_and_types);
   RUN_TEST(test_status_missing_fields_use_defaults);
   RUN_TEST(test_status_no_sides_is_not_success);
   RUN_TEST(test_status_malformed_json);
@@ -564,6 +716,16 @@ int main(int, char **)
   RUN_TEST(test_settings_side_names_of_various_lengths);
   RUN_TEST(test_settings_malformed_json_keeps_defaults);
   RUN_TEST(test_parse_reboot_hour);
+
+  RUN_TEST(test_tween_eases_between_endpoints);
+  RUN_TEST(test_tween_same_endpoints_is_inactive_and_zero_duration_is_clamped);
+  RUN_TEST(test_easing_curves);
+
+  RUN_TEST(test_night_hour_window_wraps_midnight);
+  RUN_TEST(test_should_dim_after_timeout_unless_in_settings);
+  RUN_TEST(test_safe_wake_arms_after_delay);
+  RUN_TEST(test_format_temp_in_both_units);
+  RUN_TEST(test_wrap_octet);
 
   return UNITY_END();
 }

@@ -34,7 +34,7 @@ jobs:
 
       - name: Coverage report (Cobertura)
         if: always()
-        run: gcovr -r . --filter src/ --xml-pretty -o coverage.xml
+        run: gcovr -r . --filter src/ --exclude-throw-branches --exclude-unreachable-branches --xml-pretty -o coverage.xml
 
       - name: Upload firmware artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

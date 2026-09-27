@@ -103,7 +103,7 @@ The hardware-free core (`src/dial_logic.cpp`: temperature maths, arc geometry an
 
 ```bash
 pio test -e native
-gcovr -r . --filter src/ --xml-pretty -o coverage.xml   # pip install gcovr
+gcovr -r . --filter src/ --exclude-throw-branches --exclude-unreachable-branches --xml-pretty -o coverage.xml   # pip install gcovr
 ```
 
 ### 5. Configure Pod Connection

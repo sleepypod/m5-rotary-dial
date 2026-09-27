@@ -2,8 +2,9 @@
 #define DIAL_LOGIC_H
 
 // Hardware-free core of the dial: temperature maths, arc geometry and
-// colour, detent acceleration, the OFF stop, the loader shimmer, and Pod
-// JSON parsing. Plain C++17, no Arduino. main.cpp and sleepypod_api.cpp call
+// colour, detent acceleration, the OFF stop, the loader shimmer, tweens,
+// the night window, backlight timing, and Pod JSON parsing. Plain C++17,
+// no Arduino. main.cpp and sleepypod_api.cpp call
 // into this; test/test_logic exercises it on the host.
 
 #include <stdint.h>
@@ -78,6 +79,36 @@ struct ShimmerParams
 constexpr int SHIMMER_RESTING = 0x7FFF;
 constexpr float SHIMMER_MIN_SPAN_DEG = 24.0f;
 ShimmerParams shimmerAt(unsigned long now, float spanFrom, float spanTo, bool night);
+
+// ==================== Tweens ====================
+
+// Time-based tweens (millis driven, never block).
+struct Tween
+{
+  float from = 0, to = 0;
+  unsigned long t0 = 0, dur = 1;
+  bool active = false;
+};
+void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now);
+float tweenValue(Tween &t, unsigned long now); // eased; deactivates once past dur
+float easeOutCubic(float p);
+float easeInOutCubic(float p);
+
+// ==================== Time & backlight ====================
+
+// Night when hour is inside [startHour, endHour), wrapping past midnight
+// when startHour > endHour (22..7 is the default).
+bool isNightHour(int hour, int startHour, int endHour);
+// Dim after DIM_TIMEOUT_MS of inactivity (DIM_TIMEOUT_NIGHT_MS at night),
+// never inside settings.
+bool shouldDim(bool inSettings, unsigned long sinceActivityMs, bool night);
+// While dimmed, input arriving SAFE_WAKE_ARM_MS or more after the dim only
+// wakes the screen.
+bool safeWakeArmed(unsigned long now, unsigned long dimmedAt);
+// "78" in Fahrenheit, "25.6" in Celsius.
+void formatTemp(int tempF, bool fahrenheit, char *buf, size_t n);
+// IP editor: an octet stepped past either end wraps around.
+uint8_t wrapOctet(int value);
 
 // ==================== Pod JSON ====================
 
