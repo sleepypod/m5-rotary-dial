@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <ArduinoJson.h>
 
 // Same literal Arduino's PI macro expands to, so the trig below stays
@@ -177,13 +178,82 @@ ShimmerParams shimmerAt(unsigned long now, float spanFrom, float spanTo, bool ni
   return s;
 }
 
+// ==================== Tweens ====================
+
+void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now)
+{
+  t.from = from;
+  t.to = to;
+  t.t0 = now;
+  t.dur = dur < 1 ? 1 : dur;
+  t.active = (from != to);
+}
+
+float easeOutCubic(float p) { return 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p); }
+
+float easeInOutCubic(float p)
+{
+  return p < 0.5f ? 4.0f * p * p * p : 1.0f - powf(-2.0f * p + 2.0f, 3.0f) / 2.0f;
+}
+
+float tweenValue(Tween &t, unsigned long now)
+{
+  if (!t.active) return t.to;
+  float p = (float)(now - t.t0) / (float)t.dur;
+  if (p >= 1.0f)
+  {
+    t.active = false;
+    return t.to;
+  }
+  return t.from + (t.to - t.from) * easeInOutCubic(p);
+}
+
+// ==================== Time & backlight ====================
+
+bool isNightHour(int hour, int startHour, int endHour)
+{
+  if (startHour > endHour) return hour >= startHour || hour < endHour;
+  return hour >= startHour && hour < endHour;
+}
+
+bool shouldDim(bool inSettings, unsigned long sinceActivityMs, bool night)
+{
+  unsigned long timeout = night ? DIM_TIMEOUT_NIGHT_MS : DIM_TIMEOUT_MS;
+  return !inSettings && sinceActivityMs > timeout;
+}
+
+bool safeWakeArmed(unsigned long now, unsigned long dimmedAt)
+{
+  return (now - dimmedAt) >= SAFE_WAKE_ARM_MS;
+}
+
+void formatTemp(int tempF, bool fahrenheit, char *buf, size_t n)
+{
+  if (fahrenheit) snprintf(buf, n, "%d", tempF);
+  else snprintf(buf, n, "%.1f", fahrenheitToCelsius((float)tempF));
+}
+
+uint8_t wrapOctet(int value)
+{
+  value %= 256;
+  if (value < 0) value += 256;
+  return (uint8_t)value;
+}
+
 // ==================== Pod JSON ====================
 
+// Callers only pass string literals or values already checked with
+// is<const char *>(), so src is never null.
 static void copyStr(char *dst, size_t n, const char *src)
 {
-  if (!src) src = "";
   strncpy(dst, src, n - 1);
   dst[n - 1] = '\0';
+}
+
+// Copies a string field into dst; anything that is not a string leaves dst alone.
+static void strField(JsonVariant v, char *dst, size_t n)
+{
+  if (v.is<const char *>()) copyStr(dst, n, v.as<const char *>());
 }
 
 // First of the two keys that holds an integer, else fallback. Written out
@@ -195,6 +265,38 @@ static int intField(JsonObject o, const char *a, const char *b, int fallback)
   if (o[a].is<int>()) return o[a].as<int>();
   if (b && o[b].is<int>()) return o[b].as<int>();
   return fallback;
+}
+
+// One side in either response format:
+//   REST (sleepypod-core): { leftSide: { targetTemperature, currentTemperature, isPowered } }
+//   legacy:                { left: { targetTemperatureF, currentTemperatureF, isOn } }
+// Without a power flag the REST format infers it from target > 0 (the Pod
+// reports 0 for an off side); legacy assumes on.
+static void parseSide(JsonDocument &doc, const char *restKey, const char *legacyKey, SideStatus &side)
+{
+  bool rest = doc[restKey].is<JsonObject>();
+  if (!rest && !doc[legacyKey].is<JsonObject>()) return;
+  JsonObject o = doc[rest ? restKey : legacyKey];
+
+  if (rest)
+  {
+    side.targetTemperatureF = intField(o, "targetTemperature", "targetLevel", TEMP_DEFAULT_F);
+    side.currentTemperatureF = intField(o, "currentTemperature", nullptr, side.targetTemperatureF);
+  }
+  else
+  {
+    side.targetTemperatureF = intField(o, "targetTemperatureF", "targetTemperature", TEMP_DEFAULT_F);
+    side.currentTemperatureF = intField(o, "currentTemperatureF", "currentTemperature", side.targetTemperatureF);
+  }
+
+  // isPowered and isOn are accepted in either format; a non-bool is ignored
+  if (o["isPowered"].is<bool>())
+    side.isPowered = o["isPowered"].as<bool>();
+  else if (o["isOn"].is<bool>())
+    side.isPowered = o["isOn"].as<bool>();
+  else
+    side.isPowered = rest ? (side.targetTemperatureF > 0) : true;
+  side.valid = true;
 }
 
 PodStatus parsePodStatus(const char *json, const char **error)
@@ -211,64 +313,8 @@ PodStatus parsePodStatus(const char *json, const char **error)
     return status;
   }
 
-  // Parse left side - try both possible response formats
-  // Format 1 (sleepypod-core REST): { leftSide: { targetTemperature, currentTemperature } }
-  // Format 2 (raw/legacy):          { left: { targetTemperatureF, isOn } }
-  if (doc["leftSide"].is<JsonObject>())
-  {
-    JsonObject left = doc["leftSide"];
-    status.left.targetTemperatureF = intField(left, "targetTemperature", "targetLevel", TEMP_DEFAULT_F);
-    status.left.currentTemperatureF = intField(left, "currentTemperature", nullptr, status.left.targetTemperatureF);
-    // isPowered: check multiple possible field names
-    if (left["isPowered"].is<bool>())
-      status.left.isPowered = left["isPowered"].as<bool>();
-    else if (left["isOn"].is<bool>())
-      status.left.isPowered = left["isOn"].as<bool>();
-    else
-      status.left.isPowered = (status.left.targetTemperatureF > 0);
-    status.left.valid = true;
-  }
-  else if (doc["left"].is<JsonObject>())
-  {
-    JsonObject left = doc["left"];
-    status.left.targetTemperatureF = intField(left, "targetTemperatureF", "targetTemperature", TEMP_DEFAULT_F);
-    status.left.currentTemperatureF = intField(left, "currentTemperatureF", "currentTemperature", status.left.targetTemperatureF);
-    if (left["isOn"].is<bool>())
-      status.left.isPowered = left["isOn"].as<bool>();
-    else if (left["isPowered"].is<bool>())
-      status.left.isPowered = left["isPowered"].as<bool>();
-    else
-      status.left.isPowered = true;
-    status.left.valid = true;
-  }
-
-  // Parse right side (same dual-format handling)
-  if (doc["rightSide"].is<JsonObject>())
-  {
-    JsonObject right = doc["rightSide"];
-    status.right.targetTemperatureF = intField(right, "targetTemperature", "targetLevel", TEMP_DEFAULT_F);
-    status.right.currentTemperatureF = intField(right, "currentTemperature", nullptr, status.right.targetTemperatureF);
-    if (right["isPowered"].is<bool>())
-      status.right.isPowered = right["isPowered"].as<bool>();
-    else if (right["isOn"].is<bool>())
-      status.right.isPowered = right["isOn"].as<bool>();
-    else
-      status.right.isPowered = (status.right.targetTemperatureF > 0);
-    status.right.valid = true;
-  }
-  else if (doc["right"].is<JsonObject>())
-  {
-    JsonObject right = doc["right"];
-    status.right.targetTemperatureF = intField(right, "targetTemperatureF", "targetTemperature", TEMP_DEFAULT_F);
-    status.right.currentTemperatureF = intField(right, "currentTemperatureF", "currentTemperature", status.right.targetTemperatureF);
-    if (right["isOn"].is<bool>())
-      status.right.isPowered = right["isOn"].as<bool>();
-    else if (right["isPowered"].is<bool>())
-      status.right.isPowered = right["isPowered"].as<bool>();
-    else
-      status.right.isPowered = true;
-    status.right.valid = true;
-  }
+  parseSide(doc, "leftSide", "left", status.left);
+  parseSide(doc, "rightSide", "right", status.right);
 
   status.success = (status.left.valid || status.right.valid);
   return status;
@@ -293,19 +339,12 @@ PodSettings parsePodSettings(const char *json, const char **error)
     return settings;
   }
 
-  // Side names
-  if (doc["sides"]["left"]["name"].is<const char *>())
-    copyStr(settings.leftName, sizeof(settings.leftName), doc["sides"]["left"]["name"].as<const char *>());
-  if (doc["sides"]["right"]["name"].is<const char *>())
-    copyStr(settings.rightName, sizeof(settings.rightName), doc["sides"]["right"]["name"].as<const char *>());
-
-  // Device settings
-  if (doc["device"]["temperatureUnit"].is<const char *>())
-    copyStr(settings.temperatureUnit, sizeof(settings.temperatureUnit), doc["device"]["temperatureUnit"].as<const char *>());
-  if (doc["device"]["rebootDaily"].is<bool>())
-    settings.rebootDaily = doc["device"]["rebootDaily"].as<bool>();
-  if (doc["device"]["rebootTime"].is<const char *>())
-    copyStr(settings.rebootTime, sizeof(settings.rebootTime), doc["device"]["rebootTime"].as<const char *>());
+  JsonObject sides = doc["sides"], device = doc["device"];
+  strField(sides["left"]["name"], settings.leftName, sizeof(settings.leftName));
+  strField(sides["right"]["name"], settings.rightName, sizeof(settings.rightName));
+  strField(device["temperatureUnit"], settings.temperatureUnit, sizeof(settings.temperatureUnit));
+  strField(device["rebootTime"], settings.rebootTime, sizeof(settings.rebootTime));
+  if (device["rebootDaily"].is<bool>()) settings.rebootDaily = device["rebootDaily"].as<bool>();
 
   settings.success = true;
   return settings;

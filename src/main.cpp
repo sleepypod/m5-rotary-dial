@@ -200,13 +200,7 @@ int lastDrawnMinute = -1;
 uint32_t frameUsLast = 0, frameUsMax = 0, frameCount = 0;
 uint32_t sectUs[4] = {0, 0, 0, 0}; // arc, marker+sides, text, push
 
-// Time-based tweens (millis driven, never block)
-struct Tween
-{
-  float from = 0, to = 0;
-  unsigned long t0 = 0, dur = 1;
-  bool active = false;
-};
+// Time-based tweens (millis driven, never block); see dial_logic.h
 Tween arcTween;       // arc fill angle
 unsigned long lastDetentTime = 0;
 
@@ -316,8 +310,6 @@ void openSettings();
 bool consumeSafeWake();
 unsigned long uiMillis();
 void noteDetent(unsigned long now, int &stepSize);
-void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now);
-float tweenValue(Tween &t, unsigned long now);
 void buildArcTable();
 void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int sigma10, float pulse, bool grey, const Theme &th);
 void flushPendingApi();
@@ -711,7 +703,7 @@ void setupMDNS()
 bool consumeSafeWake()
 {
   if (!isDimmed) return false;
-  bool armed = (uiMillis() - dimmedAt) >= SAFE_WAKE_ARM_MS;
+  bool armed = safeWakeArmed(uiMillis(), dimmedAt);
   recordActivity();
   return armed;
 }
@@ -975,33 +967,6 @@ void drawTemperatureUI()
   uiDirty = true;
 }
 
-void tweenStart(Tween &t, float from, float to, unsigned long dur, unsigned long now)
-{
-  t.from = from;
-  t.to = to;
-  t.t0 = now;
-  t.dur = dur < 1 ? 1 : dur;
-  t.active = (from != to);
-}
-
-static float easeOutCubic(float p) { return 1.0f - (1.0f - p) * (1.0f - p) * (1.0f - p); }
-static float easeInOutCubic(float p)
-{
-  return p < 0.5f ? 4.0f * p * p * p : 1.0f - powf(-2.0f * p + 2.0f, 3.0f) / 2.0f;
-}
-
-float tweenValue(Tween &t, unsigned long now)
-{
-  if (!t.active) return t.to;
-  float p = (float)(now - t.t0) / (float)t.dur;
-  if (p >= 1.0f)
-  {
-    t.active = false;
-    return t.to;
-  }
-  return t.from + (t.to - t.from) * easeInOutCubic(p);
-}
-
 Theme currentTheme()
 {
   Theme th;
@@ -1092,12 +1057,6 @@ static void drawStatusLine(const char *label, const char *value, int y, uint16_t
   sprite.fillSmoothCircle(x0 + wl + gap / 2, y, 1, color);
   sprite.drawString(value, x0 + wl + gap, y);
   sprite.setTextDatum(middle_center);
-}
-
-static void formatTemp(int tempF, char *buf, size_t n)
-{
-  if (useFahrenheit) snprintf(buf, n, "%d", tempF);
-  else snprintf(buf, n, "%.1f", fahrenheitToCelsius((float)tempF));
 }
 
 void buildArcTable()
@@ -1304,7 +1263,7 @@ void renderMainScreen(unsigned long now)
     }
     else if (!powerOn)
     {
-      formatTemp(currentF, val, sizeof(val));
+      formatTemp(currentF, useFahrenheit, val, sizeof(val));
       drawStatusLine("Off", val, y, th.muted);
     }
     else if (offStop.accum > 0)
@@ -1313,12 +1272,12 @@ void renderMainScreen(unsigned long now)
     }
     else if (abs(diff) <= 1)
     {
-      formatTemp(currentF, val, sizeof(val));
+      formatTemp(currentF, useFahrenheit, val, sizeof(val));
       drawStatusLine("at", val, y, th.secondary);
     }
     else
     {
-      formatTemp(currentF, val, sizeof(val));
+      formatTemp(currentF, useFahrenheit, val, sizeof(val));
       drawStatusLine(diff > 0 ? "heating" : "cooling", val, y, diff > 0 ? th.warm : th.cool);
     }
   }
@@ -1712,10 +1671,7 @@ void handleEncoderInIPEditor()
       int steps = encoderAccumulator / 4;
       encoderAccumulator = encoderAccumulator % 4;
 
-      int newValue = (int)tempIPOctets[ipEditorOctet] + steps;
-      if (newValue < 0) newValue = 256 + (newValue % 256);
-      if (newValue > 255) newValue = newValue % 256;
-      tempIPOctets[ipEditorOctet] = newValue;
+      tempIPOctets[ipEditorOctet] = wrapOctet((int)tempIPOctets[ipEditorOctet] + steps);
 
       drawIPEditor();
     }
@@ -2279,11 +2235,7 @@ bool isNightTime()
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return false;
 
-  int hour = timeinfo.tm_hour;
-  if (NIGHT_START_HOUR > NIGHT_END_HOUR)
-    return (hour >= NIGHT_START_HOUR || hour < NIGHT_END_HOUR);
-  else
-    return (hour >= NIGHT_START_HOUR && hour < NIGHT_END_HOUR);
+  return isNightHour(timeinfo.tm_hour, NIGHT_START_HOUR, NIGHT_END_HOUR);
 }
 
 
@@ -2305,11 +2257,10 @@ void recordActivity()
 void updateBrightness()
 {
   unsigned long now = uiMillis();
-  unsigned long timeSinceActivity = now - lastActivityTime;
-  unsigned long dimTimeout = isNightTime() ? DIM_TIMEOUT_NIGHT_MS : DIM_TIMEOUT_MS;
+  bool night = isNightTime();
   uint8_t targetBrightness;
 
-  if (!inSettingsMenu && timeSinceActivity > dimTimeout)
+  if (shouldDim(inSettingsMenu, now - lastActivityTime, night))
   {
     targetBrightness = BRIGHTNESS_DIM;
     if (!isDimmed)
@@ -2322,7 +2273,7 @@ void updateBrightness()
   }
   else
   {
-    targetBrightness = isNightTime() ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY;
+    targetBrightness = night ? BRIGHTNESS_NIGHT : BRIGHTNESS_DAY;
     isDimmed = false;
   }
 
