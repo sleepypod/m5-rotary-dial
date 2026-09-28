@@ -28,6 +28,9 @@ It shows where your mattress is, where it is going, and lets you turn it, click 
 <p align="center"><strong><a href="https://sleepypod.github.io/m5-rotary-dial/">See the full walkthrough →</a></strong><br>
 <sub>Every screen, the night theme, and how each control behaves. Every frame is captured from the device.</sub></p>
 
+<p align="center"><strong><a href="https://makerworld.com/en/models/3365781-sleepypod-dial-enclosure-for-m5stack-dial">Print the enclosure on MakerWorld →</a></strong><br>
+<sub>A two-part bedside stand for the Dial. Print files are also in <a href="hardware/"><code>hardware/</code></a>.</sub></p>
+
 ## Five things, and only five
 
 | You do | It does |
@@ -46,6 +49,13 @@ Local only: the dial talks to sleepypod-core on your network, found by mDNS (`_s
 
 - **[M5Stack Dial](https://shop.m5stack.com/products/m5stack-dial-esp32-s3-smart-rotary-knob-w-1-28-round-touch-screen)** — ESP32-S3, 240x240 round capacitive touchscreen, rotary encoder
 - **sleepypod-core** running on your Pod's local network
+
+## Enclosure
+
+The enclosure is a base and a faceplate that hold an M5Stack Dial v1.1 at the bedside.
+
+- **Easiest:** open the [MakerWorld listing](https://makerworld.com/en/models/3365781-sleepypod-dial-enclosure-for-m5stack-dial) and print its profile.
+- **From this repo:** the 3MF files in [`hardware/`](hardware/) are the same parts. See [`hardware/README.md`](hardware/README.md) for orientation and settings.
 
 ## Setup
 
