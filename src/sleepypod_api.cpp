@@ -68,6 +68,7 @@ PodStatus fetchPodStatus(IPAddress ip, uint16_t port)
   return status;
 }
 
+/** POST a clamped Fahrenheit target; omit a zero hold duration for legacy cores. */
 bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_t port, int holdMinutes)
 {
   if (holdMinutes < 0 || holdMinutes > 1440) return false;
@@ -107,6 +108,7 @@ bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_
   return success;
 }
 
+/** POST hold release for one side without requesting power or a target. */
 bool resumePodTemperature(IPAddress ip, const char *side, uint16_t port)
 {
   HTTPClient http;

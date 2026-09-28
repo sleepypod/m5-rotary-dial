@@ -105,8 +105,7 @@ bool pendingApiUpdate = false;
 PendingSideWrite pendingWrites[2];
 TemperatureControl temperatureControl[2] = {};
 int holdMinutes = 30;
-bool writeFailed = false;
-bool httpFlushInFlight = false;
+SideWriteFeedback writeFeedback[2];
 const unsigned long API_DEBOUNCE_MS = 500;
 
 // Periodic sync from sleepypod-core
@@ -242,7 +241,7 @@ SemaphoreHandle_t serialMutex = nullptr;
 volatile bool httpBusy = false;
 FlushJob httpFlushJob;
 volatile bool httpFlushDone = false;
-bool httpFlushOk = false;
+bool httpFlushOk[2] = {true, true};
 PodStatus httpFlushStatus;
 PodStatus httpSyncResult;
 volatile bool httpSyncDone = false;
@@ -328,6 +327,7 @@ void dumpScreen();
 
 // ==================== Setup ====================
 
+/** Initialize saved preferences, display, network services, and worker tasks. */
 void setup()
 {
   auto cfg = M5.config();
@@ -728,13 +728,14 @@ void noteDetent(unsigned long now, int &stepSize)
   lastDetentTime = now;
 }
 
+/** Queue a debounced user adjustment and clear only the active side’s error. */
 void applySetpoint(int newTemp)
 {
   newTemp = clampTemperatureF(newTemp);
 
   getActiveSetpoint() = newTemp;
   pendingWrites[activeSide].queueTemperature();
-  writeFailed = false;
+  writeFeedback[activeSide].queued();
   Serial.printf("Setpoint %s -> %d°F\n", activeSide == SIDE_RIGHT ? "right" : "left", newTemp);
 
   lastSetpointChangeTime = uiMillis();
@@ -744,12 +745,13 @@ void applySetpoint(int newTemp)
 
 // Local power state flips immediately; the arc cap stays hollow until the
 // Pod confirms on the next flush.
+/** Queue explicit power, superseding older targets and Resume on this side. */
 void setActivePower(bool on)
 {
   if (activeSide == SIDE_RIGHT) rightPowerOn = on;
   else leftPowerOn = on;
   pendingWrites[activeSide].queuePower();
-  writeFailed = false;
+  writeFeedback[activeSide].queued();
   Serial.printf("Power %s\n", on ? "ON" : "OFF");
   feedbackBeep(on ? 2600 : 1800);
   lastSetpointChangeTime = uiMillis();
@@ -757,13 +759,14 @@ void setActivePower(bool on)
   drawTemperatureUI();
 }
 
+/** Queue Resume when supported and consume the selecting press through release. */
 void resumeActiveTemperature()
 {
   if (!wifiConnected || !podReachable || !temperatureControl[activeSide].available) return;
   // Do not let a debounced detent (or a pending power-on) recreate the hold.
   // A running HTTP job is serialized ahead of this command by the worker.
   pendingWrites[activeSide].queueResume();
-  writeFailed = false;
+  writeFeedback[activeSide].queued();
   pendingApiUpdate = true;
   lastSetpointChangeTime = uiMillis() - API_DEBOUNCE_MS;
   inSettingsMenu = false;
@@ -802,6 +805,7 @@ void openSettings()
   drawSettingsMenu();
 }
 
+/** Route detents to settings or the main-screen temperature and off-stop controls. */
 void handleEncoderInput()
 {
   if (inSettingsMenu)
@@ -1173,6 +1177,7 @@ void drawArcRing(float solidAngle, float spanFrom, float spanTo, int glow10, int
   }
 }
 
+/** Draw the active side’s hardware target, ownership, and independent write feedback. */
 void renderMainScreen(unsigned long now)
 {
   Theme th = currentTheme();
@@ -1181,7 +1186,8 @@ void renderMainScreen(unsigned long now)
   int shownF = getDisplaySetpoint();
   bool powerOn = isActivePowerOn();
   bool online = wifiConnected && podReachable;
-  bool unconfirmed = pendingApiUpdate || httpFlushInFlight || writeFailed || !online;
+  bool unconfirmed = pendingWrites[activeSide].any() || writeFeedback[activeSide].inFlight ||
+                     writeFeedback[activeSide].failed || !online;
 
   // Arc target: snap while the encoder is moving, settle once it stops
   float targetAngle = powerOn ? setpointAngle(shownF) : ARC_START;
@@ -1313,33 +1319,21 @@ void renderMainScreen(unsigned long now)
   if (online)
   {
     const TemperatureControl &control = temperatureControl[activeSide];
-    String label;
-    if (pendingWrites[activeSide].any() ||
-        (httpFlushInFlight && httpFlushJob.writes[activeSide].any()))
-      label = "Updating...";
-    else if (writeFailed) label = "Update failed";
-    else if (control.available)
+    char expiryText[8] = "";
+    if (control.source == TemperatureSource::Manual && control.holdUntil > 0 && timeInitialized)
     {
-      label = temperatureSourceLabel(control.source);
-      if (control.source == TemperatureSource::Manual && control.holdUntil > 0 && timeInitialized)
-      {
-        time_t expiry = (time_t)(control.holdUntil / 1000);
-        struct tm until;
-        if (localtime_r(&expiry, &until))
-        {
-          char text[24];
-          snprintf(text, sizeof(text), "Hold until %02d:%02d", until.tm_hour, until.tm_min);
-          label = text;
-        }
-      }
-      if (control.blocked == TemperatureBlock::Safety) label = "Safety: " + label;
-      else if (control.blocked == TemperatureBlock::Off) label = "Off: " + label;
-      else if (control.blocked == TemperatureBlock::Unknown) label = "Blocked: " + label;
+      time_t expiry = (time_t)(control.holdUntil / 1000);
+      struct tm until;
+      if (localtime_r(&expiry, &until))
+        snprintf(expiryText, sizeof(expiryText), "%02d:%02d", until.tm_hour, until.tm_min);
     }
+    char label[40];
+    formatControlStatus(control, pendingWrites[activeSide].any() || writeFeedback[activeSide].inFlight,
+                        writeFeedback[activeSide].failed, expiryText, label, sizeof(label));
     sprite.setFont(&fonts::Font0);
     sprite.setTextDatum(middle_center);
-    sprite.setTextColor(writeFailed || control.blocked == TemperatureBlock::Safety ? th.alert : th.muted);
-    sprite.drawString(label.c_str(), centerX, 181);
+    sprite.setTextColor(writeFeedback[activeSide].failed || control.blocked == TemperatureBlock::Safety ? th.alert : th.muted);
+    sprite.drawString(label, centerX, 181);
   }
 
   // ---- Clock / connectivity at the arc opening ----
@@ -1441,6 +1435,7 @@ void renderDimScreen()
 
 // ==================== Settings Menu ====================
 
+/** Render the selected preference, capability hints, and navigation controls. */
 void drawSettingsMenu()
 {
   bool nightMode = isNightTime();
@@ -1538,6 +1533,7 @@ void drawSettingsMenu()
   sprite.pushSprite(0, 0);
 }
 
+/** Navigate settings and persist preferences or queue the selected action. */
 void handleEncoderInSettings()
 {
   long newPosition = readEncoder();
@@ -2387,6 +2383,7 @@ bool isActivePowerOn()
   return activeSide == SIDE_RIGHT ? rightPowerOn : leftPowerOn;
 }
 
+/** Return the short display label for a settings entry. */
 String getMenuItemName(MenuItem item)
 {
   switch (item)
@@ -2419,6 +2416,7 @@ bool notePodRequestResult(bool ok)
 // Snapshot whatever changed since the last flush and hand it to the HTTP
 // worker. Local state stays as the user set it; the arc cap stays hollow
 // until the worker reports back.
+/** Snapshot each side’s pending writes and supported hold duration for the worker. */
 void flushPendingApi()
 {
   pendingApiUpdate = false;
@@ -2426,13 +2424,13 @@ void flushPendingApi()
   {
     httpFlushJob.writes[i] = pendingWrites[i];
     httpFlushJob.holdMinutes[i] = temperatureControl[i].available ? holdMinutes : 0;
+    if (pendingWrites[i].any()) writeFeedback[i].started();
     pendingWrites[i] = {};
   }
   httpFlushJob.setpoint[0] = leftSetpoint;
   httpFlushJob.setpoint[1] = rightSetpoint;
   httpFlushJob.powerOn[0] = leftPowerOn;
   httpFlushJob.powerOn[1] = rightPowerOn;
-  httpFlushInFlight = true;
 
   httpBusy = true;
   uint8_t kind = HTTP_JOB_FLUSH;
@@ -2441,6 +2439,7 @@ void flushPendingApi()
 
 // Worker: power first (so a setpoint lands on a side that is on), then
 // temperature, per side. Never touches the display or UI state.
+/** Serialize Pod commands per side and collect independent results plus fresh status. */
 void httpTask(void *)
 {
   const char *names[2] = {"left", "right"};
@@ -2452,9 +2451,9 @@ void httpTask(void *)
 
     if (kind == HTTP_JOB_FLUSH)
     {
-      bool ok = true;
       for (int i = 0; i < 2; i++)
       {
+        bool ok = true;
         const PendingSideWrite &write = httpFlushJob.writes[i];
         bool powerOk = true;
         if (write.power)
@@ -2465,8 +2464,8 @@ void httpTask(void *)
                                  httpFlushJob.holdMinutes[i]) && ok;
         if (write.resume)
           ok = resumePodTemperature(podIP, names[i], podPort) && ok;
+        httpFlushOk[i] = ok;
       }
-      httpFlushOk = ok;
       // Refresh ownership and the effective target immediately, including after
       // Resume. A failed write is never retried by status polling.
       httpFlushStatus = fetchPodStatus(podIP, podPort);
@@ -2483,15 +2482,23 @@ void httpTask(void *)
 }
 
 // Main loop side: fold worker results back into UI state
+/** Complete only dispatched sides; newer queued input supersedes older feedback. */
 void consumeHttpResults()
 {
   if (httpFlushDone)
   {
     httpFlushDone = false;
-    httpFlushInFlight = false;
-    writeFailed = !httpFlushOk || !httpFlushStatus.success;
+    bool allWritesOk = true;
+    for (int i = 0; i < 2; i++)
+    {
+      if (!httpFlushJob.writes[i].any()) continue;
+      const SideStatus &side = i == 0 ? httpFlushStatus.left : httpFlushStatus.right;
+      writeFeedback[i].completed(httpFlushOk[i], httpFlushStatus.success && side.valid,
+                                 pendingWrites[i].any());
+      allWritesOk = httpFlushOk[i] && allWritesOk;
+    }
     applyPodStatus(httpFlushStatus);
-    if (!httpFlushOk) podReachable = notePodRequestResult(false);
+    if (!allWritesOk) podReachable = notePodRequestResult(false);
     drawTemperatureUI(); // failure remains visible even if the status read worked
   }
   if (httpSyncDone)
@@ -2502,6 +2509,7 @@ void consumeHttpResults()
 }
 
 
+/** Load hardware state, optional control capabilities, and Pod preferences at startup. */
 void syncStatusFromPod()
 {
   Serial.println("Syncing status from Pod...");
@@ -2572,6 +2580,7 @@ void syncFromPod()
   xQueueSend(httpQueue, &kind, 0);
 }
 
+/** Refresh control metadata while protecting targets with newer queued input. */
 void applyPodStatus(const PodStatus &status)
 {
   bool needsRedraw = false;
@@ -2585,10 +2594,11 @@ void applyPodStatus(const PodStatus &status)
 
   if (status.success)
   {
+    if (status.left.valid) temperatureControl[0] = status.left.control;
+    if (status.right.valid) temperatureControl[1] = status.right.control;
+    needsRedraw = true;
     if (status.left.valid && !pendingWrites[0].any())
     {
-      temperatureControl[0] = status.left.control;
-      needsRedraw = true;
       if (leftPowerOn != status.left.isPowered) { leftPowerOn = status.left.isPowered; needsRedraw = true; }
       // The Pod reports target 0 for a side that is off; mergeSetpoint keeps the last real setpoint
       int merged = mergeSetpoint(leftSetpoint, status.left);
@@ -2597,8 +2607,6 @@ void applyPodStatus(const PodStatus &status)
     }
     if (status.right.valid && !pendingWrites[1].any())
     {
-      temperatureControl[1] = status.right.control;
-      needsRedraw = true;
       if (rightPowerOn != status.right.isPowered) { rightPowerOn = status.right.isPowered; needsRedraw = true; }
       int merged = mergeSetpoint(rightSetpoint, status.right);
       if (rightSetpoint != merged) { rightSetpoint = merged; needsRedraw = true; }

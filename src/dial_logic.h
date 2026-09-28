@@ -123,7 +123,9 @@ struct TemperatureControl
   int64_t holdUntil; // Unix epoch milliseconds; 0 means no usable expiry
 };
 
+/** Return the display name of an ownership source, including unknown values. */
 const char *temperatureSourceLabel(TemperatureSource source);
+/** Cycle the supported hold choices; invalid persisted values restart at 30. */
 int nextHoldMinutes(int minutes); // cycle the dial's 15 / 30 / 60 / 120 minute choices
 
 // Commands waiting for debounce. The latest explicit action supersedes a
@@ -133,11 +135,35 @@ struct PendingSideWrite
   bool temperature = false;
   bool power = false;
   bool resume = false;
+  /** Queue a target, retaining a preceding power-on and superseding Resume. */
   void queueTemperature();
+  /** Queue explicit power and discard older targets or Resume commands. */
   void queuePower();
+  /** Release ownership instead of sending any older queued target or power. */
   void queueResume();
+  /** Whether this side has at least one operation waiting for dispatch. */
   bool any() const { return temperature || power || resume; }
 };
+
+/** Main-loop confirmation state for one side; never shared across sides. */
+struct SideWriteFeedback
+{
+  bool failed = false;
+  bool inFlight = false;
+  /** Clear only this side's previous failure when the user supplies new input. */
+  void queued();
+  /** Mark this side's immutable command snapshot as awaiting confirmation. */
+  void started();
+  /** Ignore an older job's failure when a newer command is already queued. */
+  void completed(bool writeOk, bool statusValid, bool newerPending);
+};
+
+/** Format ownership and request progress, retaining a known block as a prefix.
+ * localExpiry is HH:MM, or empty when the local clock is unavailable.
+ * Output is always terminated when n > 0; n == 0 leaves buf untouched.
+ */
+void formatControlStatus(const TemperatureControl &control, bool updating, bool failed,
+                         const char *localExpiry, char *buf, size_t n);
 
 struct SideStatus
 {

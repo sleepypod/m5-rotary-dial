@@ -267,6 +267,7 @@ static int intField(JsonObject o, const char *a, const char *b, int fallback)
   return fallback;
 }
 
+/** Map known ownership sources to short labels; tolerate future source values. */
 const char *temperatureSourceLabel(TemperatureSource source)
 {
   switch (source)
@@ -280,6 +281,7 @@ const char *temperatureSourceLabel(TemperatureSource source)
   }
 }
 
+/** Cycle the four duration choices, recovering invalid values to the default. */
 int nextHoldMinutes(int minutes)
 {
   switch (minutes)
@@ -292,24 +294,74 @@ int nextHoldMinutes(int minutes)
   }
 }
 
+/** Queue a target after any pending power-on and supersede an older Resume. */
 void PendingSideWrite::queueTemperature()
 {
   temperature = true;
   resume = false;
 }
 
+/** Queue power while cancelling an older queued target or Resume. */
 void PendingSideWrite::queuePower()
 {
   power = true;
   temperature = resume = false;
 }
 
+/** Queue hold release while cancelling older queued power and target commands. */
 void PendingSideWrite::queueResume()
 {
   resume = true;
   temperature = power = false;
 }
 
+/** Clear a previous error for this side without changing an in-flight job. */
+void SideWriteFeedback::queued()
+{
+  failed = false;
+}
+
+/** Begin confirmation of a dispatched side's command. */
+void SideWriteFeedback::started()
+{
+  inFlight = true;
+}
+
+/** Complete a snapshot; a newer queued action owns subsequent feedback. */
+void SideWriteFeedback::completed(bool writeOk, bool statusValid, bool newerPending)
+{
+  inFlight = false;
+  failed = !newerPending && (!writeOk || !statusValid);
+}
+
+/** Compose the compact ownership line without hiding known safety/off blocks. */
+void formatControlStatus(const TemperatureControl &control, bool updating, bool failed,
+                         const char *localExpiry, char *buf, size_t n)
+{
+  const char *prefix = "";
+  if (control.available)
+  {
+    if (control.blocked == TemperatureBlock::Safety) prefix = "Safety: ";
+    else if (control.blocked == TemperatureBlock::Off) prefix = "Off: ";
+    else if (control.blocked == TemperatureBlock::Unknown) prefix = "Blocked: ";
+  }
+  const char *label = "";
+  char hold[24];
+  if (updating) label = "Updating...";
+  else if (failed) label = "Update failed";
+  else if (control.available)
+  {
+    label = temperatureSourceLabel(control.source);
+    if (control.source == TemperatureSource::Manual && control.holdUntil > 0 && localExpiry[0])
+    {
+      snprintf(hold, sizeof(hold), "Hold until %s", localExpiry);
+      label = hold;
+    }
+  }
+  snprintf(buf, n, "%s%s", prefix, label);
+}
+
+/** Parse optional controller metadata without using its proposed hardware target. */
 static TemperatureControl parseTemperatureControl(JsonVariant value)
 {
   TemperatureControl control = {};
@@ -340,6 +392,7 @@ static TemperatureControl parseTemperatureControl(JsonVariant value)
 //   legacy:                { left: { targetTemperatureF, currentTemperatureF, isOn } }
 // Without a power flag the REST format infers it from target > 0 (the Pod
 // reports 0 for an off side); legacy assumes on.
+/** Parse one hardware side and its optional ownership metadata in either status format. */
 static void parseSide(JsonDocument &doc, const char *restKey, const char *legacyKey, SideStatus &side)
 {
   bool rest = doc[restKey].is<JsonObject>();
