@@ -112,12 +112,40 @@ uint8_t wrapOctet(int value);
 
 // ==================== Pod JSON ====================
 
+enum class TemperatureSource : uint8_t { None, Manual, RunOnce, Autopilot, Schedule, Unknown };
+enum class TemperatureBlock : uint8_t { None, Safety, Off, Unknown };
+
+struct TemperatureControl
+{
+  bool available; // absent on older core versions and before controller startup
+  TemperatureSource source;
+  TemperatureBlock blocked;
+  int64_t holdUntil; // Unix epoch milliseconds; 0 means no usable expiry
+};
+
+const char *temperatureSourceLabel(TemperatureSource source);
+int nextHoldMinutes(int minutes); // cycle the dial's 15 / 30 / 60 / 120 minute choices
+
+// Commands waiting for debounce. The latest explicit action supersedes a
+// conflicting queued action; an already running job finishes before the next.
+struct PendingSideWrite
+{
+  bool temperature = false;
+  bool power = false;
+  bool resume = false;
+  void queueTemperature();
+  void queuePower();
+  void queueResume();
+  bool any() const { return temperature || power || resume; }
+};
+
 struct SideStatus
 {
   int targetTemperatureF; // 55-110 (0 when the Pod reports the side off)
   int currentTemperatureF;
   bool isPowered;
   bool valid; // true if successfully parsed
+  TemperatureControl control;
 };
 
 struct PodStatus

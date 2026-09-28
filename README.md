@@ -21,7 +21,7 @@ It shows where your mattress is, where it is going, and lets you turn it, click 
 <tr>
 <td align="center"><img src="docs/video/turn.gif" width="220" alt="Turning"><br><strong>Turn</strong><br><sub>1° per detent, 2° when you spin. The arc settles when you stop.</sub></td>
 <td align="center"><img src="docs/video/loader.gif" width="220" alt="Getting there"><br><strong>Getting there</strong><br><sub>Solid fill is the mattress. The dim span to the target shrinks as the bed catches up.</sub></td>
-<td align="center"><img src="docs/video/power.gif" width="220" alt="Off and on"><br><strong>Click</strong><br><sub>One click empties the arc. One more brings it back at the last setpoint.</sub></td>
+<td align="center"><img src="docs/video/power.gif" width="220" alt="Off and on"><br><strong>Click</strong><br><sub>One click empties the arc. One more lets core choose the current target.</sub></td>
 </tr>
 </table>
 
@@ -31,15 +31,19 @@ It shows where your mattress is, where it is going, and lets you turn it, click 
 <p align="center"><strong><a href="https://makerworld.com/en/models/3365781-sleepypod-dial-enclosure-for-m5stack-dial">Print the enclosure on MakerWorld →</a></strong><br>
 <sub>A two-part bedside stand for the Dial. Print files are also in <a href="hardware/"><code>hardware/</code></a>.</sub></p>
 
-## Five things, and only five
+## Controls
 
 | You do | It does |
 |---|---|
 | **Turn** | Moves the target. 1° per detent, 2° when you spin. Two detents below 55° reach an off stop. |
-| **Click**, or tap ⏻ | Turns your side off, or back on at the last setpoint. |
+| **Click**, or tap ⏻ | Turns your side off, or back on using core’s current target. |
 | **Hold**, or tap ⚙ | Opens settings after a ring fills. Release early and nothing happens. |
 | **Settings › Side** | Picks Left or Right once. It is remembered and never changes by accident. |
+| **Settings › Hold duration** | Cycles 15, 30, 60, or 120 minutes for your next adjustment (default 30). |
+| **Settings › Resume** | Releases your side’s manual hold so core can resume the applicable automation. |
 | **Touch while dim** | Only wakes the screen. The next turn counts. |
+
+With temperature-control support in core, the main screen shows the current owner and manual hold expiry, plus any safety/off block. Older core versions keep the existing temperature requests; hold duration and Resume take effect once core reports support.
 
 Local only: the dial talks to sleepypod-core on your network, found by mDNS (`_sleepypod._tcp`) or an IP you set. Between 10 pm and 7 am it shifts to a red-on-black theme with no sounds. Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial). For the full feature reference see [`docs/features.md`](docs/features.md); for boot, loop, rendering and state diagrams see [`docs/architecture.md`](docs/architecture.md).
 

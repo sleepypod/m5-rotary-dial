@@ -34,10 +34,22 @@ The dial communicates with sleepypod-core over your local network — no cloud, 
 - **Real-Time Sync**: Polls Pod status every 30 seconds for external changes (backs off when the Pod is unreachable)
 - **Debounced, non-blocking updates**: Changes are sent 500ms after the dial stops, from a worker task, so a slow Pod never stalls the dial
 - **Unconfirmed writes are visible**: The arc's end cap is hollow until the Pod acknowledges a change
-- **Local changes win**: Pod sync never overwrites a setpoint touched in the last 30 seconds
+- **Local changes win**: Background polling waits 30 seconds after interaction; a completed write refreshes ownership and the effective target immediately, without overwriting newer queued input
 - **Connection Status**: "No Wi-Fi" / "Pod offline" on the main screen when degraded
 - **Auto-Reconnect**: Recovers WiFi automatically after router restarts
 - **Auto-Restart**: Configurable daily restart for reliability
+
+### Manual holds and Resume
+
+A user adjustment creates a per-side manual hold in core. **Settings > Hold duration** cycles 15, 30, 60, and 120 minutes (default 30), saved on the dial for future adjustments. Changing this preference alone does not send a command or renew an existing hold.
+
+The main screen shows Manual hold, Run once, Autopilot, Schedule, or No owner below the mattress temperature. Manual holds show their expiry in the dial's configured local time when its clock is initialized; otherwise they show "Manual hold". Safety/off blocks are displayed alongside ownership. The large number remains the effective hardware target, not a blocked controller's proposed target.
+
+**Settings > Resume** releases the active side's hold through `POST /api/device/temperature/resume` with `{"side":"left"}` (or right). Core decides the currently applicable automation; Resume does not itself power a side on. Resume cancels that side's queued temperature/power commands, and waits behind any request already in flight. A later turn or power command supersedes a queued Resume. Shutdown cancels a queued temperature change.
+
+Temperature writes retain the 500ms debounce. The worker reads status immediately after writes/Resume so the display reflects core's result. It shows "Updating..." while the request is in flight and "Update failed" if the write or confirming status read fails. Polling never resends a target or renews a hold. Core owns expiry even when the dial disconnects.
+
+Compatibility is detected per side through `temperatureControl.left/right` in `GET /api/device/status`. Until that object is present, the dial omits `holdMinutes`, leaves the ownership line empty, and marks Resume unavailable. The duration preference remains saved for when core supports it. This covers older strict-validation APIs and controller startup. Hold expiry is parsed as a 64-bit Unix millisecond timestamp. See the [core consumer API contract](https://github.com/sleepypod/core/blob/feat/temperature-controller/docs/temperature-control.md).
 
 ### Automatic Night Mode
 - **Automatic Activation**: Red-only theme between 10pm and 7am (configurable)
@@ -114,5 +126,7 @@ are the power and gear glyphs beside the clock; the hold shows a progress ring.
 | **Rotate 2 detents below 55°F** | Also turns the side off (the OFF stop); any detent up turns it back on |
 | **Hold the dial or screen 1.5s** or **tap the gear** | Open settings; a ring fills around the rim, release early to cancel |
 | **Settings > Side** | Choose Left or Right; it switches immediately and is remembered |
+| **Settings > Hold duration** | Cycle 15 / 30 / 60 / 120 minutes for future adjustments |
+| **Settings > Resume** | Release the active side's manual hold and refresh its effective target |
 | **Any input while dimmed** | Wakes the screen only (after the 3-second safe-wake arming) |
 

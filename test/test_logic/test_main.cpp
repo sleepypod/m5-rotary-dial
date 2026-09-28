@@ -665,6 +665,133 @@ static void test_wrap_octet()
   TEST_ASSERT_EQUAL_UINT8(88, wrapOctet(88 + 512));
 }
 
+// ==================== Temperature ownership ====================
+
+static void test_control_per_side_and_millisecond_expiry()
+{
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"rightSide":{"targetTemperature":0},"temperatureControl":{"left":{"source":"manual","holdUntil":1790636400000,"blocked":null,"targetTemperature":90},"right":{"source":"schedule","holdUntil":null,"blocked":"off","targetTemperature":80}}})");
+  TEST_ASSERT_TRUE(s.success);
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Manual, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT64(1790636400000LL, s.left.control.holdUntil);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::None, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Schedule, (int)s.right.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Off, (int)s.right.control.blocked);
+  TEST_ASSERT_EQUAL_INT64(0, s.right.control.holdUntil);
+  // Ownership's proposed target must never replace effective hardware status.
+  TEST_ASSERT_EQUAL_INT(75, s.left.targetTemperatureF);
+  TEST_ASSERT_EQUAL_INT(0, s.right.targetTemperatureF);
+  TEST_ASSERT_FALSE(s.right.isPowered);
+}
+
+static void test_control_absent_null_and_wrong_types()
+{
+  const char *payloads[] = {
+    R"({"leftSide":{"targetTemperature":75}})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":null})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":null}})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":"manual"}})"
+  };
+  for (const char *payload : payloads)
+  {
+    PodStatus s = parsePodStatus(payload);
+    TEST_ASSERT_TRUE(s.success);
+    TEST_ASSERT_FALSE(s.left.control.available);
+    TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  }
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":null,"blocked":null,"holdUntil":null}}})");
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::None, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::None, (int)s.left.control.blocked);
+}
+
+static void test_control_unknown_fields_and_bad_expiry()
+{
+  PodStatus s = parsePodStatus(R"({"left":{"targetTemperatureF":75},"temperatureControl":{"left":{"source":"future-source","blocked":123,"holdUntil":"1790636400000"}}})");
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Unknown, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Unknown, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":true,"holdUntil":-1}}})");
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Unknown, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"holdUntil":1.5}}})");
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+}
+
+static void test_control_automation_and_safety()
+{
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"rightSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":"run-once","blocked":"safety"},"right":{"source":"autopilot"}}})");
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::RunOnce, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Autopilot, (int)s.right.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Safety, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_STRING("Manual hold", temperatureSourceLabel(TemperatureSource::Manual));
+  TEST_ASSERT_EQUAL_STRING("Run once", temperatureSourceLabel(s.left.control.source));
+  TEST_ASSERT_EQUAL_STRING("Autopilot", temperatureSourceLabel(s.right.control.source));
+  TEST_ASSERT_EQUAL_STRING("Schedule", temperatureSourceLabel(TemperatureSource::Schedule));
+  TEST_ASSERT_EQUAL_STRING("No owner", temperatureSourceLabel(TemperatureSource::None));
+  TEST_ASSERT_EQUAL_STRING("Unknown owner", temperatureSourceLabel(TemperatureSource::Unknown));
+}
+
+static void test_hold_duration_choices()
+{
+  TEST_ASSERT_EQUAL_INT(60, nextHoldMinutes(30));
+  TEST_ASSERT_EQUAL_INT(120, nextHoldMinutes(60));
+  TEST_ASSERT_EQUAL_INT(15, nextHoldMinutes(120));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(15));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(0));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(1441));
+}
+
+static void test_resume_supersedes_debounced_adjustment_per_side()
+{
+  PendingSideWrite sides[2];
+  TEST_ASSERT_FALSE(sides[0].any());
+  sides[0].queuePower();
+  sides[0].queueTemperature();
+  sides[1].queueTemperature();
+  sides[0].queueResume();
+  TEST_ASSERT_TRUE(sides[0].resume);
+  TEST_ASSERT_FALSE(sides[0].temperature);
+  TEST_ASSERT_FALSE(sides[0].power);
+  TEST_ASSERT_TRUE(sides[1].temperature);
+  TEST_ASSERT_FALSE(sides[1].resume);
+  TEST_ASSERT_TRUE(sides[0].any());
+}
+
+static void test_new_input_supersedes_resume_and_shutdown_cancels_temperature()
+{
+  PendingSideWrite write;
+  write.queueResume();
+  write.queueTemperature();
+  TEST_ASSERT_TRUE(write.temperature);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queuePower(); // shutdown must not be followed by a stale temperature
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_FALSE(write.temperature);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queueResume();
+  write.queuePower();
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queueTemperature(); // turning up from off still sends power then target
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_TRUE(write.temperature);
+}
+
+static void test_in_flight_snapshot_is_not_changed_by_resume()
+{
+  PendingSideWrite pending;
+  pending.queueTemperature();
+  const PendingSideWrite inFlight = pending;
+  pending = {};
+  pending.queueResume();
+  TEST_ASSERT_TRUE(inFlight.temperature);
+  TEST_ASSERT_FALSE(inFlight.resume);
+  TEST_ASSERT_FALSE(pending.temperature);
+  TEST_ASSERT_TRUE(pending.resume);
+}
+
 int main(int, char **)
 {
   UNITY_BEGIN();
@@ -709,6 +836,15 @@ int main(int, char **)
   RUN_TEST(test_status_malformed_json);
   RUN_TEST(test_off_side_target_zero_is_not_a_setpoint);
   RUN_TEST(test_merge_setpoint_accepts_only_in_range_targets);
+
+  RUN_TEST(test_control_per_side_and_millisecond_expiry);
+  RUN_TEST(test_control_absent_null_and_wrong_types);
+  RUN_TEST(test_control_unknown_fields_and_bad_expiry);
+  RUN_TEST(test_control_automation_and_safety);
+  RUN_TEST(test_hold_duration_choices);
+  RUN_TEST(test_resume_supersedes_debounced_adjustment_per_side);
+  RUN_TEST(test_new_input_supersedes_resume_and_shutdown_cancels_temperature);
+  RUN_TEST(test_in_flight_snapshot_is_not_changed_by_resume);
 
   RUN_TEST(test_settings_full_payload);
   RUN_TEST(test_settings_defaults_when_fields_missing);

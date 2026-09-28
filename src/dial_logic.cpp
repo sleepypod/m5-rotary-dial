@@ -267,6 +267,74 @@ static int intField(JsonObject o, const char *a, const char *b, int fallback)
   return fallback;
 }
 
+const char *temperatureSourceLabel(TemperatureSource source)
+{
+  switch (source)
+  {
+    case TemperatureSource::Manual: return "Manual hold";
+    case TemperatureSource::RunOnce: return "Run once";
+    case TemperatureSource::Autopilot: return "Autopilot";
+    case TemperatureSource::Schedule: return "Schedule";
+    case TemperatureSource::None: return "No owner";
+    default: return "Unknown owner";
+  }
+}
+
+int nextHoldMinutes(int minutes)
+{
+  switch (minutes)
+  {
+    case 15: return 30;
+    case 30: return 60;
+    case 60: return 120;
+    case 120: return 15;
+    default: return 30;
+  }
+}
+
+void PendingSideWrite::queueTemperature()
+{
+  temperature = true;
+  resume = false;
+}
+
+void PendingSideWrite::queuePower()
+{
+  power = true;
+  temperature = resume = false;
+}
+
+void PendingSideWrite::queueResume()
+{
+  resume = true;
+  temperature = power = false;
+}
+
+static TemperatureControl parseTemperatureControl(JsonVariant value)
+{
+  TemperatureControl control = {};
+  if (!value.is<JsonObject>()) return control;
+  control.available = true;
+  const char *source = value["source"] | "";
+  if (!strcmp(source, "manual")) control.source = TemperatureSource::Manual;
+  else if (!strcmp(source, "run-once")) control.source = TemperatureSource::RunOnce;
+  else if (!strcmp(source, "autopilot")) control.source = TemperatureSource::Autopilot;
+  else if (!strcmp(source, "schedule")) control.source = TemperatureSource::Schedule;
+  else if (!value["source"].isNull()) control.source = TemperatureSource::Unknown;
+
+  const char *blocked = value["blocked"] | "";
+  if (!strcmp(blocked, "safety")) control.blocked = TemperatureBlock::Safety;
+  else if (!strcmp(blocked, "off")) control.blocked = TemperatureBlock::Off;
+  else if (!value["blocked"].isNull()) control.blocked = TemperatureBlock::Unknown;
+
+  if (value["holdUntil"].is<int64_t>())
+  {
+    int64_t expiry = value["holdUntil"].as<int64_t>();
+    if (expiry > 0) control.holdUntil = expiry;
+  }
+  return control;
+}
+
 // One side in either response format:
 //   REST (sleepypod-core): { leftSide: { targetTemperature, currentTemperature, isPowered } }
 //   legacy:                { left: { targetTemperatureF, currentTemperatureF, isOn } }
@@ -297,6 +365,7 @@ static void parseSide(JsonDocument &doc, const char *restKey, const char *legacy
   else
     side.isPowered = rest ? (side.targetTemperatureF > 0) : true;
   side.valid = true;
+  side.control = parseTemperatureControl(doc["temperatureControl"][legacyKey]);
 }
 
 PodStatus parsePodStatus(const char *json, const char **error)
