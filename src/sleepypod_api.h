@@ -16,7 +16,11 @@ PodStatus fetchPodStatus(IPAddress ip, uint16_t port = 3000);
 // Set temperature for a side
 // POST /api/device/temperature
 // side: "left" or "right", temperature: 55-110°F
-bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_t port = 3000);
+// holdMinutes: 0 omits the optional field for older cores; otherwise 1-1440.
+bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_t port = 3000, int holdMinutes = 0);
+
+// POST /api/device/temperature/resume. Releases ownership without powering on.
+bool resumePodTemperature(IPAddress ip, const char *side, uint16_t port = 3000);
 
 // Set power state for a side
 // POST /api/device/power

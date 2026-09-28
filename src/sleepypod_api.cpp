@@ -68,8 +68,10 @@ PodStatus fetchPodStatus(IPAddress ip, uint16_t port)
   return status;
 }
 
-bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_t port)
+/** POST a clamped Fahrenheit target; omit a zero hold duration for legacy cores. */
+bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_t port, int holdMinutes)
 {
+  if (holdMinutes < 0 || holdMinutes > 1440) return false;
   temperatureF = clampTemperatureF(temperatureF);
 
   HTTPClient http;
@@ -83,6 +85,7 @@ bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_
   JsonDocument doc;
   doc["side"] = side;
   doc["temperature"] = temperatureF;
+  if (holdMinutes > 0) doc["holdMinutes"] = holdMinutes;
 
   String payload;
   serializeJson(doc, payload);
@@ -103,6 +106,26 @@ bool setPodTemperature(IPAddress ip, const char *side, int temperatureF, uint16_
 
   http.end();
   return success;
+}
+
+/** POST hold release for one side without requesting power or a target. */
+bool resumePodTemperature(IPAddress ip, const char *side, uint16_t port)
+{
+  HTTPClient http;
+  String url = "http://" + ip.toString() + ":" + String(port) + "/api/device/temperature/resume";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_TIMEOUT_MS);
+
+  JsonDocument doc;
+  doc["side"] = side;
+  String payload;
+  serializeJson(doc, payload);
+  int httpCode = http.POST(payload);
+  Serial.printf("Resume %s temperature: %d\n", side, httpCode);
+  http.end();
+  return httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_NO_CONTENT;
 }
 
 bool setPodPower(IPAddress ip, const char *side, bool powered, uint16_t port)

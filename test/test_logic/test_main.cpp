@@ -665,6 +665,256 @@ static void test_wrap_octet()
   TEST_ASSERT_EQUAL_UINT8(88, wrapOctet(88 + 512));
 }
 
+// ==================== Temperature ownership ====================
+
+/** Keep 64-bit expiry and ownership separate from each side’s effective target. */
+static void test_control_per_side_and_millisecond_expiry()
+{
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"rightSide":{"targetTemperature":0},"temperatureControl":{"left":{"source":"manual","holdUntil":1790636400000,"blocked":null,"targetTemperature":90},"right":{"source":"schedule","holdUntil":null,"blocked":"off","targetTemperature":80}}})");
+  TEST_ASSERT_TRUE(s.success);
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Manual, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT64(1790636400000LL, s.left.control.holdUntil);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::None, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Schedule, (int)s.right.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Off, (int)s.right.control.blocked);
+  TEST_ASSERT_EQUAL_INT64(0, s.right.control.holdUntil);
+  // Ownership's proposed target must never replace effective hardware status.
+  TEST_ASSERT_EQUAL_INT(75, s.left.targetTemperatureF);
+  TEST_ASSERT_EQUAL_INT(0, s.right.targetTemperatureF);
+  TEST_ASSERT_FALSE(s.right.isPowered);
+}
+
+/** Tolerate absent and malformed capabilities while preserving valid hardware status. */
+static void test_control_absent_null_and_wrong_types()
+{
+  const char *payloads[] = {
+    R"({"leftSide":{"targetTemperature":75}})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":null})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":null}})",
+    R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":"manual"}})"
+  };
+  for (const char *payload : payloads)
+  {
+    PodStatus s = parsePodStatus(payload);
+    TEST_ASSERT_TRUE(s.success);
+    TEST_ASSERT_FALSE(s.left.control.available);
+    TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  }
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":null,"blocked":null,"holdUntil":null}}})");
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::None, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::None, (int)s.left.control.blocked);
+}
+
+/** Unknown sources and invalid expiry types cannot invent a valid manual expiry. */
+static void test_control_unknown_fields_and_bad_expiry()
+{
+  PodStatus s = parsePodStatus(R"({"left":{"targetTemperatureF":75},"temperatureControl":{"left":{"source":"future-source","blocked":123,"holdUntil":"1790636400000"}}})");
+  TEST_ASSERT_TRUE(s.left.control.available);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Unknown, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Unknown, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":true,"holdUntil":-1}}})");
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Unknown, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+  s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"temperatureControl":{"left":{"holdUntil":1.5}}})");
+  TEST_ASSERT_EQUAL_INT64(0, s.left.control.holdUntil);
+}
+
+/** Parse automation sources and safety independently and label every source. */
+static void test_control_automation_and_safety()
+{
+  PodStatus s = parsePodStatus(R"({"leftSide":{"targetTemperature":75},"rightSide":{"targetTemperature":75},"temperatureControl":{"left":{"source":"run-once","blocked":"safety"},"right":{"source":"autopilot"}}})");
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::RunOnce, (int)s.left.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureSource::Autopilot, (int)s.right.control.source);
+  TEST_ASSERT_EQUAL_INT((int)TemperatureBlock::Safety, (int)s.left.control.blocked);
+  TEST_ASSERT_EQUAL_STRING("Manual hold", temperatureSourceLabel(TemperatureSource::Manual));
+  TEST_ASSERT_EQUAL_STRING("Run once", temperatureSourceLabel(s.left.control.source));
+  TEST_ASSERT_EQUAL_STRING("Autopilot", temperatureSourceLabel(s.right.control.source));
+  TEST_ASSERT_EQUAL_STRING("Schedule", temperatureSourceLabel(TemperatureSource::Schedule));
+  TEST_ASSERT_EQUAL_STRING("No owner", temperatureSourceLabel(TemperatureSource::None));
+  TEST_ASSERT_EQUAL_STRING("Unknown owner", temperatureSourceLabel(TemperatureSource::Unknown));
+}
+
+/** Cycle all saved hold choices and recover unsupported preference values. */
+static void test_hold_duration_choices()
+{
+  TEST_ASSERT_EQUAL_INT(60, nextHoldMinutes(30));
+  TEST_ASSERT_EQUAL_INT(120, nextHoldMinutes(60));
+  TEST_ASSERT_EQUAL_INT(15, nextHoldMinutes(120));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(15));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(0));
+  TEST_ASSERT_EQUAL_INT(30, nextHoldMinutes(1441));
+}
+
+/** Resume replaces only its own side’s pending power and temperature commands. */
+static void test_resume_supersedes_debounced_adjustment_per_side()
+{
+  PendingSideWrite sides[2];
+  TEST_ASSERT_FALSE(sides[0].any());
+  sides[0].queuePower();
+  sides[0].queueTemperature();
+  sides[1].queueTemperature();
+  sides[0].queueResume();
+  TEST_ASSERT_TRUE(sides[0].resume);
+  TEST_ASSERT_FALSE(sides[0].temperature);
+  TEST_ASSERT_FALSE(sides[0].power);
+  TEST_ASSERT_TRUE(sides[1].temperature);
+  TEST_ASSERT_FALSE(sides[1].resume);
+  TEST_ASSERT_TRUE(sides[0].any());
+}
+
+/** New input supersedes Resume; shutdown discards an older temperature command. */
+static void test_new_input_supersedes_resume_and_shutdown_cancels_temperature()
+{
+  PendingSideWrite write;
+  write.queueResume();
+  write.queueTemperature();
+  TEST_ASSERT_TRUE(write.temperature);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queuePower(); // shutdown must not be followed by a stale temperature
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_FALSE(write.temperature);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queueResume();
+  write.queuePower();
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_FALSE(write.resume);
+  write.queueTemperature(); // turning up from off still sends power then target
+  TEST_ASSERT_TRUE(write.power);
+  TEST_ASSERT_TRUE(write.temperature);
+}
+
+/** Resume queued later cannot mutate a command snapshot already being executed. */
+static void test_in_flight_snapshot_is_not_changed_by_resume()
+{
+  PendingSideWrite pending;
+  pending.queueTemperature();
+  const PendingSideWrite inFlight = pending;
+  pending = {};
+  pending.queueResume();
+  TEST_ASSERT_TRUE(inFlight.temperature);
+  TEST_ASSERT_FALSE(inFlight.resume);
+  TEST_ASSERT_FALSE(pending.temperature);
+  TEST_ASSERT_TRUE(pending.resume);
+}
+
+/** Every queued operation, including power-only, prevents an idle dispatch. */
+static void test_pending_any_for_each_command_combination()
+{
+  for (int bits = 0; bits < 8; bits++)
+  {
+    PendingSideWrite write;
+    write.temperature = bits & 1;
+    write.power = bits & 2;
+    write.resume = bits & 4;
+    TEST_ASSERT_EQUAL(bits != 0, write.any());
+  }
+}
+
+/** A left-side failure neither marks nor gets cleared by right-side input. */
+static void test_write_feedback_is_independent_per_side()
+{
+  SideWriteFeedback sides[2];
+  sides[0].started();
+  TEST_ASSERT_TRUE(sides[0].inFlight);
+  TEST_ASSERT_FALSE(sides[1].inFlight);
+  sides[0].completed(false, true, false);
+  TEST_ASSERT_FALSE(sides[0].inFlight);
+  TEST_ASSERT_TRUE(sides[0].failed);
+  sides[1].queued();
+  sides[1].started();
+  sides[1].completed(true, true, false);
+  TEST_ASSERT_TRUE(sides[0].failed);
+  TEST_ASSERT_FALSE(sides[1].failed);
+  sides[0].queued();
+  TEST_ASSERT_FALSE(sides[0].failed);
+}
+
+/** Each write needs both command success and its own side's valid status. */
+static void test_write_feedback_confirmation_combinations()
+{
+  for (int writeOk = 0; writeOk <= 1; writeOk++)
+    for (int statusValid = 0; statusValid <= 1; statusValid++)
+    {
+      SideWriteFeedback feedback;
+      feedback.started();
+      feedback.completed(writeOk, statusValid, false);
+      TEST_ASSERT_FALSE(feedback.inFlight);
+      TEST_ASSERT_EQUAL(!writeOk || !statusValid, feedback.failed);
+    }
+}
+
+/** A late failure cannot replace the progress of a newer user command. */
+static void test_newer_input_supersedes_in_flight_failure()
+{
+  SideWriteFeedback feedback;
+  feedback.started();
+  feedback.queued();
+  TEST_ASSERT_TRUE(feedback.inFlight);
+  feedback.completed(false, false, true);
+  TEST_ASSERT_FALSE(feedback.failed);
+  TEST_ASSERT_FALSE(feedback.inFlight);
+  feedback.started();
+  feedback.completed(true, true, false);
+  TEST_ASSERT_FALSE(feedback.failed);
+}
+
+/** Known safety remains visible during request progress and failure. */
+static void test_control_status_retains_safety_during_write_feedback()
+{
+  TemperatureControl control = {true, TemperatureSource::Manual, TemperatureBlock::Safety, 1790636400000LL};
+  char label[40];
+  formatControlStatus(control, false, true, "22:45", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Safety: Update failed", label);
+  formatControlStatus(control, true, true, "22:45", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Safety: Updating...", label);
+  formatControlStatus(control, false, false, "22:45", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Safety: Hold until 22:45", label);
+}
+
+/** Legacy cores stay blank at rest; pending/error feedback still works. */
+static void test_control_status_without_capability_or_local_clock()
+{
+  TemperatureControl control = {};
+  char label[40];
+  formatControlStatus(control, false, false, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("", label);
+  formatControlStatus(control, true, false, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Updating...", label);
+  formatControlStatus(control, false, true, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Update failed", label);
+  control.available = true;
+  control.source = TemperatureSource::Manual;
+  control.holdUntil = 1790636400000LL;
+  formatControlStatus(control, false, false, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Manual hold", label);
+  control.holdUntil = 0;
+  formatControlStatus(control, false, false, "22:45", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Manual hold", label);
+}
+
+/** Ownership and blocking labels remain distinct, including future blocks. */
+static void test_control_status_ownership_blocks_and_buffer_bounds()
+{
+  TemperatureControl control = {true, TemperatureSource::Schedule, TemperatureBlock::Off, 0};
+  char label[40];
+  formatControlStatus(control, false, false, "22:45", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Off: Schedule", label);
+  control.blocked = TemperatureBlock::Unknown;
+  formatControlStatus(control, false, true, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Blocked: Update failed", label);
+  control.blocked = TemperatureBlock::None;
+  formatControlStatus(control, false, false, "", label, sizeof(label));
+  TEST_ASSERT_EQUAL_STRING("Schedule", label);
+  char small[4] = {'x', 'x', 'x', 'x'};
+  formatControlStatus(control, true, false, "", small, sizeof(small));
+  TEST_ASSERT_EQUAL_STRING("Upd", small);
+  formatControlStatus(control, false, false, "", small, 0);
+  TEST_ASSERT_EQUAL_STRING("Upd", small);
+}
+
 int main(int, char **)
 {
   UNITY_BEGIN();
@@ -709,6 +959,23 @@ int main(int, char **)
   RUN_TEST(test_status_malformed_json);
   RUN_TEST(test_off_side_target_zero_is_not_a_setpoint);
   RUN_TEST(test_merge_setpoint_accepts_only_in_range_targets);
+
+  RUN_TEST(test_control_per_side_and_millisecond_expiry);
+  RUN_TEST(test_control_absent_null_and_wrong_types);
+  RUN_TEST(test_control_unknown_fields_and_bad_expiry);
+  RUN_TEST(test_control_automation_and_safety);
+  RUN_TEST(test_hold_duration_choices);
+  RUN_TEST(test_resume_supersedes_debounced_adjustment_per_side);
+  RUN_TEST(test_new_input_supersedes_resume_and_shutdown_cancels_temperature);
+  RUN_TEST(test_in_flight_snapshot_is_not_changed_by_resume);
+
+  RUN_TEST(test_pending_any_for_each_command_combination);
+  RUN_TEST(test_write_feedback_is_independent_per_side);
+  RUN_TEST(test_write_feedback_confirmation_combinations);
+  RUN_TEST(test_newer_input_supersedes_in_flight_failure);
+  RUN_TEST(test_control_status_retains_safety_during_write_feedback);
+  RUN_TEST(test_control_status_without_capability_or_local_clock);
+  RUN_TEST(test_control_status_ownership_blocks_and_buffer_bounds);
 
   RUN_TEST(test_settings_full_payload);
   RUN_TEST(test_settings_defaults_when_fields_missing);
