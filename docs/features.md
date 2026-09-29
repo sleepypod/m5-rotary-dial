@@ -2,7 +2,7 @@
 
 The README is the product page. This is the reference for how the firmware behaves and what it talks to. See also [architecture.md](architecture.md) for boot, loop, rendering and state diagrams.
 
-An M5Stack Dial (ESP32-S3) temperature controller for [sleepypod-core](https://github.com/throwaway31265/free-sleep), providing a physical rotary interface to control your Pod's left and right side temperatures.
+An M5Stack Dial (ESP32-S3) temperature controller for [sleepypod-core](https://github.com/sleepypod/core), providing a physical rotary interface to control your Pod's left and right side temperatures.
 
 Based on [RotaryDial by dallonby](https://github.com/dallonby/RotaryDial) — the original FreeSleep rotary dial controller. This project adapts the concept to use sleepypod-core's tRPC/REST APIs, mDNS auto-discovery, and side-name personalization.
 
@@ -78,8 +78,9 @@ The intent is for the dial to expose its own API on port 80 for home automation.
 ## Screens
 
 Captured from the device with `tools/walkthrough.py`, which also records
-short clips of the animations into `video/` and builds
-`index.html`, a self-contained walkthrough page.
+short clips of the animations into `video/` and rebuilds the README banner.
+The [full walkthrough and setup guides](https://sleepypod.github.io/dial/) live in the unified docs.
+`docs/index.html` is a permanent redirect; the capture tool does not overwrite it.
 
 ![Turning](video/turn.gif) ![Getting there](video/loader.gif) ![Off and on](video/power.gif) ![Holding](video/settings.gif)
 
