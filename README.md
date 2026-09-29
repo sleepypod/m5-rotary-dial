@@ -25,7 +25,7 @@ It shows where your mattress is, where it is going, and lets you turn it, click 
 </tr>
 </table>
 
-<p align="center"><strong><a href="https://sleepypod.github.io/m5-rotary-dial/">See the full walkthrough →</a></strong><br>
+<p align="center"><strong><a href="https://sleepypod.github.io/dial/">See the full walkthrough →</a></strong><br>
 <sub>Every screen, the night theme, and how each control behaves. Every frame is captured from the device.</sub></p>
 
 <p align="center"><strong><a href="https://makerworld.com/en/models/3365781-sleepypod-dial-enclosure-for-m5stack-dial">Print the enclosure on MakerWorld →</a></strong><br>

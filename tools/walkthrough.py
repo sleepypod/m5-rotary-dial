@@ -1,27 +1,26 @@
 # Capture the walkthrough from a connected Dial: stills for every state, short
-# video clips of the animations, and a self-contained HTML page.
+# video clips of the animations for the unified Sleepypod documentation.
 #
 #   ~/.platformio/penv/bin/python tools/walkthrough.py            # everything
-#   ~/.platformio/penv/bin/python tools/walkthrough.py --no-video # stills + page only
+#   ~/.platformio/penv/bin/python tools/walkthrough.py --no-video # stills only
 #   ~/.platformio/penv/bin/python tools/walkthrough.py --only settings  # re-record one clip
-#   ~/.platformio/penv/bin/python tools/walkthrough.py --page-only  # rebuild the page from docs/
+#   ~/.platformio/penv/bin/python tools/walkthrough.py --banner-only  # rebuild README banner
 #
 # Needs pyserial (PlatformIO's Python has it) and ffmpeg on PATH for video.
 # Uses the firmware's serial debug channel (see handleSerialDebug in main.cpp).
 # Fake mattress temperatures (h/l/a) are local only; the Pod is never written.
-# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif, docs/index.html
-import base64, os, shutil, struct, subprocess, sys, tempfile, time, zlib
+# Outputs: docs/screens/*.png (+ banner.png), docs/video/*.mp4 + *.gif
+import os, shutil, struct, subprocess, sys, tempfile, time, zlib
 import serial
 
 PORT = os.environ.get("DIAL_PORT", "/dev/cu.usbmodem21201")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCREENS = os.path.join(ROOT, "docs", "screens")
 VIDEO = os.path.join(ROOT, "docs", "video")
-PAGE = os.path.join(ROOT, "docs", "index.html")
 W = H = 240
 NO_VIDEO = "--no-video" in sys.argv
-ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None  # capture one clip, no page
-PAGE_ONLY = "--page-only" in sys.argv  # no device: build the page from files already in docs/
+ONLY = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv else None  # capture one clip
+BANNER_ONLY = "--banner-only" in sys.argv or "--page-only" in sys.argv  # legacy flag is an alias; never replaces the redirect
 
 
 
@@ -152,33 +151,11 @@ class Dial:
             return f.read()
 
 
-def b64(kind, data):
-    return f"data:{kind};base64," + base64.b64encode(data).decode()
-
-
-STILL_NAMES = ["heating", "cooling", "at-target", "off", "on", "hold-ring", "settings", "night", "night-dim", "day-dim"]
-CLIP_NAMES = ["turn", "loader", "power", "settings"]
-
-
-def read_or_none(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except FileNotFoundError:
-        return None
-
-
 def main():
     os.makedirs(SCREENS, exist_ok=True)
     os.makedirs(VIDEO, exist_ok=True)
-    if PAGE_ONLY:
-        stills = {k: read_or_none(os.path.join(SCREENS, k + ".png")) for k in STILL_NAMES}
-        clips = {k: read_or_none(os.path.join(VIDEO, k + ".mp4")) for k in CLIP_NAMES}
-        missing = [k for k, v in stills.items() if v is None]
-        if missing:
-            sys.exit(f"missing stills: {missing}; run without --page-only first")
+    if BANNER_ONLY:
         write_banner()
-        write_page(stills, clips)
         return
     d = Dial()
     d.send("wxPa", settle=1.5)  # awake, main screen, side on, mattress at target
@@ -215,7 +192,6 @@ def main():
     }
     d.send("wa")
     write_banner()
-    write_page(stills, clips)
 
 
 def write_banner():
@@ -226,136 +202,6 @@ def write_banner():
                     "-filter_complex", "[0]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[a];[1]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[b];"
                     "[2]scale=480:480:flags=neighbor,pad=540:480:30:0:0x0B0E14[c];[a][b][c]hstack=3,pad=iw+60:ih+80:30:40:0x0B0E14", out], check=True)
     print("banner", out)
-
-
-def write_page(stills, clips):
-    slides = [
-        ("heating", "Turn toward comfort", "Solid fill is where the mattress is. The span beyond it pulses toward the number you chose and shrinks as the bed catches up."),
-        ("cooling", "Same timeline, either direction", "Cooling reads the same way: the target sits at the cap, the pulsing span is the distance still to travel."),
-        ("at-target", "Then it goes quiet", "At the target the loader disappears. Just your side, your number, the time."),
-        ("off", "Off is a click", "Click the dial, or tap the power glyph. The arc empties and the number dims. A click brings it back at the last setpoint."),
-        ("hold-ring", "Hold for settings", "Hold the dial or the screen. A ring fills around the rim; let go early and nothing happens."),
-        ("settings", "Your side is a preference", "Pick Left or Right once in Settings. Nothing on the main screen switches it by accident."),
-        ("night", "Red after ten", "Between 10 pm and 7 am the whole interface shifts to red on black at 20% brightness. No sounds at all."),
-        ("night-dim", "Glanceable at 3 am", "After five seconds it dims to 1%. Only the number and one status dot survive, by design."),
-        ("day-dim", "Wake without changing anything", "The first touch after a dim only wakes the screen. A bump in the dark never moves your temperature."),
-    ]
-    img = {k: b64("image/png", v) for k, v in stills.items()}
-
-    def slide(i, k, h, p):
-        return (f'<article class="slide"><div class="device"><img src="{img[k]}" alt="{h}" width="240" height="240"></div>'
-                f'<div class="cap"><span class="n">{i:02d}</span><h3>{h}</h3><p>{p}</p></div></article>')
-
-    def video(k, title, text):
-        if not clips.get(k):
-            return ""
-        src = b64("video/mp4", clips[k])
-        return (f'<article class="slide"><div class="device"><video src="{src}" autoplay muted loop playsinline width="240" height="240"></video></div>'
-                f'<div class="cap"><h3>{title}</h3><p>{text}</p></div></article>')
-
-    videos = "".join([
-        video("turn", "Turning", "Each detent moves the target one degree, two when you spin. The arc settles 180 ms after you stop."),
-        video("loader", "Getting there", "The span between the mattress and the target pulses gently until the bed arrives."),
-        video("power", "Off and on", "One click empties the arc. One more brings it back at the last setpoint."),
-        video("settings", "Holding", "The ring fills over a second and a half, then settings opens. Let go early and nothing happens."),
-    ])
-
-    html = f'''<title>sleepypod Dial</title>
-<meta name="description" content="A bedside knob for your Pod: one arc, one number, no menus in the dark.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600&family=Instrument+Sans:ital,wght@0,400;0,500;1,400&family=DM+Mono:wght@400;500&display=swap">
-<style>
-:root{{--bg:#F3F2EE;--ink:#15181F;--muted:#6B7079;--line:#DCD8CF;--panel:#FFFFFF;--warm:#D97F22;--cool:#2792AA;--metal:#2A2F38;--metal2:#0E1116;--screen:#0B0E14;
-  --display:'Sora',system-ui,sans-serif;--body:'Instrument Sans',system-ui,sans-serif;--mono:'DM Mono',ui-monospace,monospace}}
-@media (prefers-color-scheme: dark){{:root:not([data-theme="light"]){{--bg:#0B0E14;--ink:#F2F2F0;--muted:#9AA0A8;--line:#232833;--panel:#11151D;--warm:#FFA53C;--cool:#35C4E0;--metal:#3A404B;--metal2:#181C24;color-scheme:dark}}}}
-:root[data-theme="dark"]{{--bg:#0B0E14;--ink:#F2F2F0;--muted:#9AA0A8;--line:#232833;--panel:#11151D;--warm:#FFA53C;--cool:#35C4E0;--metal:#3A404B;--metal2:#181C24;color-scheme:dark}}
-*{{box-sizing:border-box}}
-body{{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);font-size:17px;line-height:1.5}}
-.wrap{{max-width:1080px;margin:0 auto;padding-inline:20px;padding-block:48px 80px;display:grid;gap:72px}}
-h1,h2,h3{{font-family:var(--display);font-weight:600;letter-spacing:-0.01em;text-wrap:balance;margin:0}}
-.eyebrow{{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}}
-p{{margin:0;max-width:62ch}}
-.hero{{display:grid;grid-template-columns:1.1fr 1fr;gap:40px;align-items:center}}
-.hero h1{{font-size:clamp(38px,5.5vw,60px);line-height:1.05;margin-block:10px 18px}}
-.hero .lede{{font-size:19px;color:var(--muted)}}
-.device{{position:relative;width:300px;height:300px;border-radius:50%;margin:0 auto;background:radial-gradient(circle at 35% 30%,var(--metal) 0%,var(--metal2) 70%);box-shadow:0 30px 60px -30px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.08)}}
-.device::before{{content:"";position:absolute;inset:14px;border-radius:50%;background:var(--screen);box-shadow:inset 0 0 0 2px #05070A}}
-.device img,.device video{{position:absolute;inset:30px;width:240px;height:240px;border-radius:50%;display:block;object-fit:cover}}
-.hero .device{{width:360px;height:360px}} .hero .device img,.hero .device video{{inset:40px;width:280px;height:280px}} .hero .device::before{{inset:18px}}
-.strip{{display:grid;gap:18px}}
-.rail{{display:flex;gap:20px;overflow-x:auto;scroll-snap-type:x mandatory;padding-block:8px 18px;margin-inline:-20px;padding-inline:20px;scrollbar-width:thin}}
-.slide{{flex:0 0 min(320px,84vw);scroll-snap-align:start;background:var(--panel);border:1px solid var(--line);border-radius:28px;padding:28px 22px 26px;display:grid;gap:22px;justify-items:center}}
-.slide .device{{width:240px;height:240px}} .slide .device img,.slide .device video{{inset:22px;width:196px;height:196px}} .slide .device::before{{inset:11px}}
-.cap{{justify-self:stretch}} .cap .n{{font-family:var(--mono);font-size:12px;color:var(--muted)}}
-.cap h3{{font-size:20px;margin-block:6px 8px}} .cap p{{font-size:15px;color:var(--muted)}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:28px 32px}}
-.grid h3{{font-size:17px;margin-bottom:6px}} .grid p{{font-size:15px;color:var(--muted)}}
-table{{border-collapse:collapse;width:100%;font-size:15px}} th,td{{text-align:left;padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}}
-th{{font-family:var(--mono);font-weight:500;font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}}
-td:first-child{{font-weight:500;white-space:nowrap}}
-.nums{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:18px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding-block:22px}}
-.nums b{{display:block;font-family:var(--mono);font-weight:500;font-size:26px;font-variant-numeric:tabular-nums}} .nums span{{font-size:13px;color:var(--muted)}}
-.warm{{color:var(--warm)}} .cool{{color:var(--cool)}}
-.repos{{display:flex;flex-wrap:wrap;gap:12px;margin-top:22px}}
-.repo{{display:inline-flex;align-items:center;gap:9px;padding:9px 14px;border:1px solid var(--line);border-radius:999px;color:var(--ink);text-decoration:none;font-size:15px;background:var(--panel)}}
-.repo:hover,.repo:focus-visible{{border-color:var(--muted);outline:none}} .repo .gh{{flex:none}} .repo small{{color:var(--muted);font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase}}
-footer .repos{{margin-top:12px}}
-footer{{font-size:13px;color:var(--muted)}}
-@media (max-width:760px){{.hero{{grid-template-columns:1fr}} .hero .device{{width:300px;height:300px}} .hero .device img,.hero .device video{{inset:30px;width:240px;height:240px}} .hero .device::before{{inset:14px}}}}
-</style>
-<main class="wrap">
-<section class="hero">
-  <div>
-    <div class="eyebrow">sleepypod Dial · a bedside knob for your Pod</div>
-    <h1>One arc. One number. Nothing to learn in the dark.</h1>
-    <p class="lede">A bedside knob that shows where your mattress is, where it is going, and lets you turn it, click it off, and leave it alone. Every frame on this page was captured from the device.</p>
-    <div class="repos">
-      <a class="repo" href="https://github.com/sleepypod/core"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/core <small>required</small></a>
-      <a class="repo" href="https://github.com/sleepypod/m5-rotary-dial"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/m5-rotary-dial <small>this dial</small></a>
-    </div>
-  </div>
-  <div class="device">{('<video src="' + b64("video/mp4", clips["loader"]) + '" autoplay muted loop playsinline width="280" height="280"></video>') if clips.get("loader") else ('<img src="' + img["heating"] + '" alt="Heating" width="280" height="280">')}</div>
-</section>
-<section class="strip">
-  <div><div class="eyebrow">Walkthrough</div><h2>Nine screens, in the order you meet them</h2></div>
-  <div class="rail">{"".join(slide(i + 1, k, h, p) for i, (k, h, p) in enumerate(slides))}</div>
-</section>
-{('<section class="strip"><div><div class="eyebrow">In motion</div><h2>Four things you will do every night</h2></div><div class="rail">' + videos + '</div></section>') if videos else ''}
-<section class="nums">
-  <div><b>55–110<span style="font-size:15px"> °F</span></b><span>the Pod's range, 1° per detent</span></div>
-  <div><b class="warm">2°</b><span>per detent when you spin, never more</span></div>
-  <div><b>1.5 s</b><span>hold for settings, ring shows progress</span></div>
-  <div><b class="cool">0 dB</b><span>after 10 pm, no sounds at all</span></div>
-  <div><b>19 ms</b><span>per frame, encoder polled every 1 ms</span></div>
-</section>
-<section class="strip">
-  <div><div class="eyebrow">Controls</div><h2>Five things, and only five</h2></div>
-  <div style="overflow-x:auto"><table>
-    <tr><th>You do</th><th>It does</th></tr>
-    <tr><td>Turn</td><td>Moves the target. 1° per detent, 2° when you spin. Two detents below 55° reach an off stop.</td></tr>
-    <tr><td>Click, or tap ⏻</td><td>Turns your side off, or back on at the last setpoint.</td></tr>
-    <tr><td>Hold, or tap ⚙</td><td>Opens settings after a ring fills. Release early and nothing happens.</td></tr>
-    <tr><td>Settings › Side</td><td>Picks Left or Right once. It is remembered and never changes by accident.</td></tr>
-    <tr><td>Touch while dim</td><td>Only wakes the screen. The next turn counts.</td></tr>
-  </table></div>
-</section>
-<section class="grid">
-  <div><h3>Local only</h3><p>Talks to sleepypod-core on your network. Finds the Pod by mDNS. No cloud, no account.</p></div>
-  <div><h3>Honest about the network</h3><p>A hollow cap means the Pod has not confirmed yet. "Pod offline" and "No Wi-Fi" say so in words.</p></div>
-  <div><h3>Your name on it</h3><p>The side name comes from the Pod's settings, so the dial says Jon, not L.</p></div>
-  <div><h3>Your changes win</h3><p>The Pod's own state never overwrites a number you touched in the last 30 seconds.</p></div>
-</section>
-<footer>Frames captured from an M5Stack Dial running the sleepypod-mt-rotary-dial firmware via tools/walkthrough.py. Names shown are example side names from the Pod's settings.
-  <div class="repos">
-    <a class="repo" href="https://github.com/sleepypod/core"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/core <small>required</small></a>
-    <a class="repo" href="https://github.com/sleepypod/m5-rotary-dial"><svg class="gh" viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>sleepypod/m5-rotary-dial</a>
-  </div>
-</footer>
-</main>
-'''
-    with open(PAGE, "w") as f:
-        f.write(html)
-    print("page", PAGE, len(html) // 1024, "KB")
 
 
 if __name__ == "__main__":
