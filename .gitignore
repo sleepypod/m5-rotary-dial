@@ -32,3 +32,4 @@ coverage.xml
 # Credentials
 include/credentials.h
 .reviews/
+.claude/settings.local.json
